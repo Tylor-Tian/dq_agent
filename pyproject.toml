@@ -1,0 +1,31 @@
+[project]
+name = "dq_agent"
+version = "0.1.0"
+description = "Data quality demo CLI"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+  "pandas",
+  "pyarrow",
+  "pydantic",
+  "pyyaml",
+  "typer",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dq_agent*"]
+
+[tool.setuptools.package-data]
+dq_agent = ["resources/*.yml"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

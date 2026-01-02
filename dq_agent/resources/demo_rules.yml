@@ -1,0 +1,23 @@
+version: 1
+dataset:
+  name: demo_orders
+  primary_key: [order_id]
+  time_column: created_at
+columns:
+  order_id:
+    type: string
+    required: true
+  user_id:
+    type: string
+    required: true
+  amount:
+    type: float
+    required: true
+  status:
+    type: string
+    required: true
+  created_at:
+    type: datetime
+    required: true
+report:
+  sample_rows: 20
