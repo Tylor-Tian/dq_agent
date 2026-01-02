@@ -14,7 +14,7 @@ def generate_demo_data(output_dir: Path, seed: Optional[int] = 42) -> Path:
     user_ids = rng.integers(1000, 1100, size=rows).astype(str)
     amounts = rng.normal(loc=120.0, scale=30.0, size=rows).round(2)
     statuses = rng.choice(["PAID", "REFUND", "CANCEL", "PENDING"], size=rows)
-    created_at = pd.date_range("2024-01-01", periods=rows, freq="H")
+    created_at = pd.date_range("2024-01-01", periods=rows, freq="h")
 
     df = pd.DataFrame(
         {
