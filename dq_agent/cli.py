@@ -9,6 +9,7 @@ from dq_agent.contract import validate_contract
 from dq_agent.demo.generate_demo_data import generate_demo_data
 from dq_agent.loader import load_table
 from dq_agent.report.writer_json import write_report_json
+from dq_agent.anomalies import run_anomalies
 from dq_agent.rules import run_rules
 
 app = typer.Typer(add_completion=False)
@@ -25,6 +26,7 @@ def run(
     df = load_table(data)
     issues = validate_contract(df, cfg)
     rule_results = run_rules(df, cfg)
+    anomaly_results = run_anomalies(df, cfg)
     report_path = write_report_json(
         output_dir=output_dir,
         data_path=data,
@@ -33,6 +35,7 @@ def run(
         cols=len(df.columns),
         contract_issues=issues,
         rule_results=rule_results,
+        anomalies=anomaly_results,
     )
     typer.echo(json.dumps({"report_path": str(report_path)}, ensure_ascii=False))
 
@@ -52,6 +55,7 @@ def demo(
     df = load_table(data_path)
     issues = validate_contract(df, cfg)
     rule_results = run_rules(df, cfg)
+    anomaly_results = run_anomalies(df, cfg)
     report_path = write_report_json(
         output_dir=output_dir,
         data_path=data_path,
@@ -60,5 +64,6 @@ def demo(
         cols=len(df.columns),
         contract_issues=issues,
         rule_results=rule_results,
+        anomalies=anomaly_results,
     )
     typer.echo(json.dumps({"report_path": str(report_path)}, ensure_ascii=False))

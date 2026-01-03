@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from dq_agent.contract import ContractIssue
+from dq_agent.anomalies import AnomalyResult
 from dq_agent.rules import RuleResult
 
 
@@ -19,6 +20,7 @@ def write_report_json(
     cols: int,
     contract_issues: List[ContractIssue],
     rule_results: Optional[List[RuleResult]] = None,
+    anomalies: Optional[List[AnomalyResult]] = None,
 ) -> Path:
     run_id = uuid.uuid4().hex
     run_dir = output_dir / run_id
@@ -46,6 +48,7 @@ def write_report_json(
         },
         "contract_issues": [issue.to_dict() for issue in contract_issues],
         "rule_results": [result.to_dict() for result in (rule_results or [])],
+        "anomalies": [result.to_dict() for result in (anomalies or [])],
     }
 
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
