@@ -7,15 +7,23 @@ columns:
   order_id:
     type: string
     required: true
+    checks:
+      - unique: true
   user_id:
     type: string
     required: true
+    checks:
+      - not_null: { max_null_rate: 0.01 }
   amount:
     type: float
     required: true
+    checks:
+      - range: { min: 0, max: 10000 }
   status:
     type: string
     required: true
+    checks:
+      - allowed_values: { values: ["PAID", "REFUND", "CANCEL", "PENDING"] }
   created_at:
     type: datetime
     required: true

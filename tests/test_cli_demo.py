@@ -17,3 +17,6 @@ def test_cli_demo_runs_and_writes_report_json(tmp_path: Path):
     assert "run_id" in report
     assert "summary" in report
     assert "contract_issues" in report
+    assert "rule_results" in report
+    assert report["rule_results"], "Expected rule_results to be populated"
+    assert any(result["status"] == "FAIL" for result in report["rule_results"])
