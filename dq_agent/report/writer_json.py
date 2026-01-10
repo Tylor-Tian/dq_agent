@@ -21,6 +21,7 @@ def write_report_json(
     contract_issues: List[ContractIssue],
     rule_results: Optional[List[RuleResult]] = None,
     anomalies: Optional[List[AnomalyResult]] = None,
+    observability_timing_ms: Optional[dict[str, float]] = None,
 ) -> Path:
     run_id = uuid.uuid4().hex
     run_dir = output_dir / run_id
@@ -50,6 +51,13 @@ def write_report_json(
         "rule_results": [result.to_dict() for result in (rule_results or [])],
         "anomalies": [result.to_dict() for result in (anomalies or [])],
     }
+
+    if observability_timing_ms is not None:
+        report["observability"] = {
+            "timing_ms": {
+                key: round(value, 3) for key, value in observability_timing_ms.items()
+            }
+        }
 
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report_path

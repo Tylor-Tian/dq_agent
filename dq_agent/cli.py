@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -8,6 +9,7 @@ from dq_agent.config import load_config
 from dq_agent.contract import validate_contract
 from dq_agent.demo.generate_demo_data import generate_demo_data
 from dq_agent.loader import load_table
+from dq_agent.report.writer_md import write_report_md
 from dq_agent.report.writer_json import write_report_json
 from dq_agent.anomalies import run_anomalies
 from dq_agent.rules import run_rules
@@ -22,11 +24,25 @@ def run(
     output_dir: Path = typer.Option(Path("artifacts"), "--output-dir"),
 ) -> None:
     """Run data quality checks against a dataset."""
+    timings: dict[str, float] = {}
+    start = time.perf_counter()
     cfg = load_config(config)
     df = load_table(data)
+    timings["load"] = (time.perf_counter() - start) * 1000
+
+    start = time.perf_counter()
     issues = validate_contract(df, cfg)
+    timings["contract"] = (time.perf_counter() - start) * 1000
+
+    start = time.perf_counter()
     rule_results = run_rules(df, cfg)
+    timings["rules"] = (time.perf_counter() - start) * 1000
+
+    start = time.perf_counter()
     anomaly_results = run_anomalies(df, cfg)
+    timings["anomalies"] = (time.perf_counter() - start) * 1000
+
+    report_start = time.perf_counter()
     report_path = write_report_json(
         output_dir=output_dir,
         data_path=data,
@@ -36,8 +52,25 @@ def run(
         contract_issues=issues,
         rule_results=rule_results,
         anomalies=anomaly_results,
+        observability_timing_ms=timings,
     )
-    typer.echo(json.dumps({"report_path": str(report_path)}, ensure_ascii=False))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report_md_path = report_path.with_name("report.md")
+    write_report_md(report, report_md_path)
+    timings["report"] = (time.perf_counter() - report_start) * 1000
+    report.setdefault("observability", {}).setdefault("timing_ms", {})["report"] = round(
+        timings["report"], 3
+    )
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    typer.echo(
+        json.dumps(
+            {
+                "report_json_path": str(report_path),
+                "report_md_path": str(report_md_path),
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 @app.command()
@@ -51,11 +84,25 @@ def demo(
     data_path = generate_demo_data(demo_dir, seed=seed)
 
     config_path = Path(__file__).parent / "resources" / "demo_rules.yml"
+    timings: dict[str, float] = {}
+    start = time.perf_counter()
     cfg = load_config(config_path)
     df = load_table(data_path)
+    timings["load"] = (time.perf_counter() - start) * 1000
+
+    start = time.perf_counter()
     issues = validate_contract(df, cfg)
+    timings["contract"] = (time.perf_counter() - start) * 1000
+
+    start = time.perf_counter()
     rule_results = run_rules(df, cfg)
+    timings["rules"] = (time.perf_counter() - start) * 1000
+
+    start = time.perf_counter()
     anomaly_results = run_anomalies(df, cfg)
+    timings["anomalies"] = (time.perf_counter() - start) * 1000
+
+    report_start = time.perf_counter()
     report_path = write_report_json(
         output_dir=output_dir,
         data_path=data_path,
@@ -65,5 +112,22 @@ def demo(
         contract_issues=issues,
         rule_results=rule_results,
         anomalies=anomaly_results,
+        observability_timing_ms=timings,
     )
-    typer.echo(json.dumps({"report_path": str(report_path)}, ensure_ascii=False))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report_md_path = report_path.with_name("report.md")
+    write_report_md(report, report_md_path)
+    timings["report"] = (time.perf_counter() - report_start) * 1000
+    report.setdefault("observability", {}).setdefault("timing_ms", {})["report"] = round(
+        timings["report"], 3
+    )
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    typer.echo(
+        json.dumps(
+            {
+                "report_json_path": str(report_path),
+                "report_md_path": str(report_md_path),
+            },
+            ensure_ascii=False,
+        )
+    )
