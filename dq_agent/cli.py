@@ -1,5 +1,7 @@
 import json
+import sys
 import time
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -14,6 +16,8 @@ from dq_agent.report.writer_md import write_report_md
 from dq_agent.report.writer_json import write_report_json
 from dq_agent.anomalies import run_anomalies
 from dq_agent.rules import run_rules
+from dq_agent.run_record import compare_reports, load_run_record, sha256_path, write_run_record
+
 
 class FailOn(str, Enum):
     info = "INFO"
@@ -41,97 +45,15 @@ def _should_fail(
     return any(severity_rank.get(severity, 0) >= threshold for severity in severities)
 
 
-@app.command()
-def run(
-    data: Path = typer.Option(..., "--data", help="Path to CSV/Parquet data"),
-    config: Path = typer.Option(..., "--config", help="Path to YAML/JSON config"),
-    output_dir: Path = typer.Option(Path("artifacts"), "--output-dir"),
-    fail_on: Optional[FailOn] = typer.Option(
-        None,
-        "--fail-on",
-        case_sensitive=False,
-        help="Exit with code 2 when issues/anomalies meet or exceed this severity.",
-    ),
-) -> None:
-    """Run data quality checks against a dataset."""
-    total_start = time.perf_counter()
-    timings: dict[str, float] = {}
-    start = time.perf_counter()
-    cfg = load_config(config)
-    df = load_table(data)
-    timings["load"] = (time.perf_counter() - start) * 1000
-
-    start = time.perf_counter()
-    issues = validate_contract(df, cfg)
-    timings["contract"] = (time.perf_counter() - start) * 1000
-
-    start = time.perf_counter()
-    rule_results = run_rules(df, cfg)
-    timings["rules"] = (time.perf_counter() - start) * 1000
-
-    start = time.perf_counter()
-    anomaly_results = run_anomalies(df, cfg)
-    timings["anomalies"] = (time.perf_counter() - start) * 1000
-
-    report_start = time.perf_counter()
-    report_path = write_report_json(
-        output_dir=output_dir,
-        data_path=data,
-        config_path=config,
-        rows=len(df.index),
-        cols=len(df.columns),
-        contract_issues=issues,
-        rule_results=rule_results,
-        anomalies=anomaly_results,
-        observability_timing_ms=timings,
-    )
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    report_md_path = report_path.with_name("report.md")
-    write_report_md(report, report_md_path)
-    timings["report"] = (time.perf_counter() - report_start) * 1000
-    timings["total"] = (time.perf_counter() - total_start) * 1000
-    report.setdefault("observability", {}).setdefault("timing_ms", {})["report"] = round(
-        timings["report"], 3
-    )
-    report.setdefault("observability", {}).setdefault("timing_ms", {})["total"] = round(
-        timings["total"], 3
-    )
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    typer.echo(
-        json.dumps(
-            {
-                "report_json_path": str(report_path),
-                "report_md_path": str(report_md_path),
-            },
-            ensure_ascii=False,
-        )
-    )
-    if _should_fail(
-        fail_on=fail_on,
-        contract_issues=issues,
-        rule_results=rule_results,
-        anomalies=anomaly_results,
-    ):
-        raise typer.Exit(code=2)
-
-
-@app.command()
-def demo(
-    output_dir: Path = typer.Option(Path("artifacts"), "--output-dir"),
-    seed: Optional[int] = typer.Option(42, "--seed"),
-    fail_on: Optional[FailOn] = typer.Option(
-        None,
-        "--fail-on",
-        case_sensitive=False,
-        help="Exit with code 2 when issues/anomalies meet or exceed this severity.",
-    ),
-) -> None:
-    """Generate demo data and run the contract checks."""
-    demo_dir = output_dir / "demo"
-    demo_dir.mkdir(parents=True, exist_ok=True)
-    data_path = generate_demo_data(demo_dir, seed=seed)
-
-    config_path = Path(__file__).parent / "resources" / "demo_rules.yml"
+def _execute_run(
+    *,
+    data_path: Path,
+    config_path: Path,
+    output_dir: Path,
+    command: str,
+    argv: list[str],
+) -> tuple[Path, Path, Path, list, list, list]:
+    run_started_at = datetime.now(timezone.utc)
     total_start = time.perf_counter()
     timings: dict[str, float] = {}
     start = time.perf_counter()
@@ -175,11 +97,48 @@ def demo(
         timings["total"], 3
     )
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    run_finished_at = datetime.now(timezone.utc)
+    run_record_path = write_run_record(
+        run_id=report.get("run_id", "unknown"),
+        started_at=run_started_at,
+        finished_at=run_finished_at,
+        command=command,
+        argv=argv,
+        data_path=data_path,
+        config_path=config_path,
+        output_dir=output_dir,
+        report_json_path=report_path,
+        report_md_path=report_md_path,
+    )
+    return report_path, report_md_path, run_record_path, issues, rule_results, anomaly_results
+
+
+@app.command()
+def run(
+    data: Path = typer.Option(..., "--data", help="Path to CSV/Parquet data"),
+    config: Path = typer.Option(..., "--config", help="Path to YAML/JSON config"),
+    output_dir: Path = typer.Option(Path("artifacts"), "--output-dir"),
+    fail_on: Optional[FailOn] = typer.Option(
+        None,
+        "--fail-on",
+        case_sensitive=False,
+        help="Exit with code 2 when issues/anomalies meet or exceed this severity.",
+    ),
+) -> None:
+    """Run data quality checks against a dataset."""
+    report_path, report_md_path, run_record_path, issues, rule_results, anomaly_results = _execute_run(
+        data_path=data,
+        config_path=config,
+        output_dir=output_dir,
+        command="run",
+        argv=sys.argv,
+    )
     typer.echo(
         json.dumps(
             {
                 "report_json_path": str(report_path),
                 "report_md_path": str(report_md_path),
+                "run_record_path": str(run_record_path),
             },
             ensure_ascii=False,
         )
@@ -190,4 +149,139 @@ def demo(
         rule_results=rule_results,
         anomalies=anomaly_results,
     ):
+        raise typer.Exit(code=2)
+
+
+@app.command()
+def demo(
+    output_dir: Path = typer.Option(Path("artifacts"), "--output-dir"),
+    seed: Optional[int] = typer.Option(42, "--seed"),
+    fail_on: Optional[FailOn] = typer.Option(
+        None,
+        "--fail-on",
+        case_sensitive=False,
+        help="Exit with code 2 when issues/anomalies meet or exceed this severity.",
+    ),
+) -> None:
+    """Generate demo data and run the contract checks."""
+    demo_dir = output_dir / "demo"
+    demo_dir.mkdir(parents=True, exist_ok=True)
+    data_path = generate_demo_data(demo_dir, seed=seed)
+
+    config_path = Path(__file__).parent / "resources" / "demo_rules.yml"
+    report_path, report_md_path, run_record_path, issues, rule_results, anomaly_results = _execute_run(
+        data_path=data_path,
+        config_path=config_path,
+        output_dir=output_dir,
+        command="demo",
+        argv=sys.argv,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "report_json_path": str(report_path),
+                "report_md_path": str(report_md_path),
+                "run_record_path": str(run_record_path),
+            },
+            ensure_ascii=False,
+        )
+    )
+    if _should_fail(
+        fail_on=fail_on,
+        contract_issues=issues,
+        rule_results=rule_results,
+        anomalies=anomaly_results,
+    ):
+        raise typer.Exit(code=2)
+
+
+@app.command()
+def replay(
+    run_record: Path = typer.Option(..., "--run-record", help="Path to run_record.json"),
+    output_dir: Optional[Path] = typer.Option(None, "--output-dir"),
+    strict: bool = typer.Option(False, "--strict"),
+) -> None:
+    """Replay a run from a run_record.json and compare reports."""
+    try:
+        record = load_run_record(run_record).data
+    except Exception as exc:
+        typer.echo(f"Invalid run record: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    input_section = record.get("input") or {}
+    data_path_raw = input_section.get("data_path")
+    config_path_raw = input_section.get("config_path")
+    if not data_path_raw or not config_path_raw:
+        typer.echo("Run record missing data_path or config_path.", err=True)
+        raise typer.Exit(code=1)
+
+    data_path = Path(data_path_raw)
+    config_path = Path(config_path_raw)
+    if not data_path.exists():
+        typer.echo(f"Missing data file: {data_path}", err=True)
+        raise typer.Exit(code=1)
+    if not config_path.exists():
+        typer.echo(f"Missing config file: {config_path}", err=True)
+        raise typer.Exit(code=1)
+
+    fingerprints = record.get("fingerprints") or {}
+    expected_data_sha = fingerprints.get("data_sha256")
+    expected_config_sha = fingerprints.get("config_sha256")
+    actual_data_sha = sha256_path(data_path)
+    actual_config_sha = sha256_path(config_path)
+    if expected_data_sha and actual_data_sha != expected_data_sha:
+        typer.echo(
+            f"Warning: data sha256 mismatch (expected {expected_data_sha}, got {actual_data_sha}).",
+            err=True,
+        )
+    if expected_config_sha and actual_config_sha != expected_config_sha:
+        typer.echo(
+            f"Warning: config sha256 mismatch (expected {expected_config_sha}, got {actual_config_sha}).",
+            err=True,
+        )
+
+    resolved_output_dir = output_dir
+    if resolved_output_dir is None:
+        recorded_output_dir = input_section.get("output_dir")
+        if not recorded_output_dir:
+            typer.echo("Run record missing output_dir and none provided.", err=True)
+            raise typer.Exit(code=1)
+        resolved_output_dir = Path(recorded_output_dir)
+
+    outputs = record.get("outputs") or {}
+    old_report_json_raw = outputs.get("report_json_path")
+    if not old_report_json_raw:
+        typer.echo("Run record missing report_json_path.", err=True)
+        raise typer.Exit(code=1)
+    old_report_json_path = Path(old_report_json_raw)
+    if not old_report_json_path.exists():
+        typer.echo(f"Missing original report.json: {old_report_json_path}", err=True)
+        raise typer.Exit(code=1)
+
+    new_report_path, _, _, _, _, _ = _execute_run(
+        data_path=data_path,
+        config_path=config_path,
+        output_dir=resolved_output_dir,
+        command="replay",
+        argv=sys.argv,
+    )
+
+    try:
+        old_report = json.loads(old_report_json_path.read_text(encoding="utf-8"))
+        new_report = json.loads(new_report_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        typer.echo(f"Failed to load report JSON: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    same, summary = compare_reports(old_report, new_report)
+    result = {
+        "same": same,
+        "old_run_id": record.get("run_id"),
+        "new_run_id": new_report.get("run_id"),
+        "old_report_json_path": str(old_report_json_path),
+        "new_report_json_path": str(new_report_path),
+        "diff_summary": summary,
+    }
+    typer.echo(json.dumps(result, ensure_ascii=False))
+    if strict and not same:
         raise typer.Exit(code=2)

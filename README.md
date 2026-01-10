@@ -28,7 +28,7 @@ python -m dq_agent demo
 It prints something like:
 
 ```json
-{"report_json_path": "artifacts/<run_id>/report.json", "report_md_path": "artifacts/<run_id>/report.md"}
+{"report_json_path": "artifacts/<run_id>/report.json", "report_md_path": "artifacts/<run_id>/report.md", "run_record_path": "artifacts/<run_id>/run_record.json"}
 ```
 
 ## Outputs
@@ -37,6 +37,7 @@ A demo/run creates a new run directory:
 
 - `artifacts/<run_id>/report.json`
 - `artifacts/<run_id>/report.md`
+- `artifacts/<run_id>/run_record.json` (replayable run record)
 
 `report.json` includes an `observability` section with timing and rule/anomaly counts.
 
@@ -73,6 +74,14 @@ See all CLI options:
 ```bash
 python -m dq_agent --help
 python -m dq_agent run --help
+```
+
+## Replay a run
+
+After a run completes, use the `run_record.json` to replay deterministically:
+
+```bash
+python -m dq_agent replay --run-record artifacts/<run_id>/run_record.json --strict
 ```
 
 ## Config format (YAML)
