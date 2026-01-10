@@ -38,6 +38,8 @@ A demo/run creates a new run directory:
 - `artifacts/<run_id>/report.json`
 - `artifacts/<run_id>/report.md`
 
+`report.json` includes an `observability` section with timing and rule/anomaly counts.
+
 Sample outputs (committed for quick preview):
 
 - `examples/report.md`
@@ -54,6 +56,17 @@ python -m dq_agent run --data path/to/table.parquet --config path/to/rules.yml
 Supported:
 - Data: CSV / Parquet
 - Config: YAML / JSON
+
+Fail the run when issues reach a severity threshold:
+
+```bash
+python -m dq_agent run --data path/to/table.parquet --config path/to/rules.yml --fail-on ERROR
+```
+
+Exit code behavior:
+- `0`: run completed without triggering `--fail-on`
+- `1`: config parsing or missing files
+- `2`: run completed but issues/anomalies met the `--fail-on` severity
 
 See all CLI options:
 

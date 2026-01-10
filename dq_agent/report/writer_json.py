@@ -4,11 +4,18 @@ import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from dq_agent.contract import ContractIssue
 from dq_agent.anomalies import AnomalyResult
 from dq_agent.rules import RuleResult
+
+
+TIMING_KEYS: tuple[str, ...] = ("load", "contract", "rules", "anomalies", "report", "total")
+
+
+def _count_failed(items: Iterable[dict], status_key: str = "status") -> int:
+    return sum(1 for item in items if item.get(status_key) == "FAIL")
 
 
 def write_report_json(
@@ -29,6 +36,14 @@ def write_report_json(
     report_path = run_dir / "report.json"
     started_at = datetime.now(timezone.utc)
 
+    rule_payloads = [result.to_dict() for result in (rule_results or [])]
+    anomaly_payloads = [result.to_dict() for result in (anomalies or [])]
+    timing_ms = {key: 0.0 for key in TIMING_KEYS}
+    if observability_timing_ms is not None:
+        timing_ms.update(
+            {key: round(value, 3) for key, value in observability_timing_ms.items() if key in timing_ms}
+        )
+
     report = {
         "run_id": run_id,
         "started_at": started_at.isoformat(),
@@ -48,16 +63,19 @@ def write_report_json(
             },
         },
         "contract_issues": [issue.to_dict() for issue in contract_issues],
-        "rule_results": [result.to_dict() for result in (rule_results or [])],
-        "anomalies": [result.to_dict() for result in (anomalies or [])],
+        "rule_results": rule_payloads,
+        "anomalies": anomaly_payloads,
+        "fix_actions": [],
+        "observability": {
+            "timing_ms": timing_ms,
+            "counts": {
+                "rules_total": len(rule_payloads),
+                "rules_failed": _count_failed(rule_payloads),
+                "anomalies_total": len(anomaly_payloads),
+                "anomalies_failed": _count_failed(anomaly_payloads),
+            },
+        },
     }
-
-    if observability_timing_ms is not None:
-        report["observability"] = {
-            "timing_ms": {
-                key: round(value, 3) for key, value in observability_timing_ms.items()
-            }
-        }
 
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report_path

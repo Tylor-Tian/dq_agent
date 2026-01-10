@@ -1,5 +1,6 @@
 import json
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -14,16 +15,46 @@ from dq_agent.report.writer_json import write_report_json
 from dq_agent.anomalies import run_anomalies
 from dq_agent.rules import run_rules
 
+class FailOn(str, Enum):
+    info = "INFO"
+    warn = "WARN"
+    error = "ERROR"
+
+
 app = typer.Typer(add_completion=False)
+
+
+def _should_fail(
+    *,
+    fail_on: Optional[FailOn],
+    contract_issues: list,
+    rule_results: list,
+    anomalies: list,
+) -> bool:
+    if fail_on is None:
+        return False
+    severity_rank = {"INFO": 0, "WARN": 1, "ERROR": 2}
+    threshold = severity_rank[fail_on.value]
+    severities = [issue.severity.upper() for issue in contract_issues]
+    severities.extend("ERROR" for result in rule_results if result.status == "FAIL")
+    severities.extend("ERROR" for result in anomalies if result.status == "FAIL")
+    return any(severity_rank.get(severity, 0) >= threshold for severity in severities)
 
 
 @app.command()
 def run(
-    data: Path = typer.Option(..., "--data", exists=True, help="Path to CSV/Parquet data"),
-    config: Path = typer.Option(..., "--config", exists=True, help="Path to YAML/JSON config"),
+    data: Path = typer.Option(..., "--data", help="Path to CSV/Parquet data"),
+    config: Path = typer.Option(..., "--config", help="Path to YAML/JSON config"),
     output_dir: Path = typer.Option(Path("artifacts"), "--output-dir"),
+    fail_on: Optional[FailOn] = typer.Option(
+        None,
+        "--fail-on",
+        case_sensitive=False,
+        help="Exit with code 2 when issues/anomalies meet or exceed this severity.",
+    ),
 ) -> None:
     """Run data quality checks against a dataset."""
+    total_start = time.perf_counter()
     timings: dict[str, float] = {}
     start = time.perf_counter()
     cfg = load_config(config)
@@ -58,8 +89,12 @@ def run(
     report_md_path = report_path.with_name("report.md")
     write_report_md(report, report_md_path)
     timings["report"] = (time.perf_counter() - report_start) * 1000
+    timings["total"] = (time.perf_counter() - total_start) * 1000
     report.setdefault("observability", {}).setdefault("timing_ms", {})["report"] = round(
         timings["report"], 3
+    )
+    report.setdefault("observability", {}).setdefault("timing_ms", {})["total"] = round(
+        timings["total"], 3
     )
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     typer.echo(
@@ -71,12 +106,25 @@ def run(
             ensure_ascii=False,
         )
     )
+    if _should_fail(
+        fail_on=fail_on,
+        contract_issues=issues,
+        rule_results=rule_results,
+        anomalies=anomaly_results,
+    ):
+        raise typer.Exit(code=2)
 
 
 @app.command()
 def demo(
     output_dir: Path = typer.Option(Path("artifacts"), "--output-dir"),
     seed: Optional[int] = typer.Option(42, "--seed"),
+    fail_on: Optional[FailOn] = typer.Option(
+        None,
+        "--fail-on",
+        case_sensitive=False,
+        help="Exit with code 2 when issues/anomalies meet or exceed this severity.",
+    ),
 ) -> None:
     """Generate demo data and run the contract checks."""
     demo_dir = output_dir / "demo"
@@ -84,6 +132,7 @@ def demo(
     data_path = generate_demo_data(demo_dir, seed=seed)
 
     config_path = Path(__file__).parent / "resources" / "demo_rules.yml"
+    total_start = time.perf_counter()
     timings: dict[str, float] = {}
     start = time.perf_counter()
     cfg = load_config(config_path)
@@ -118,8 +167,12 @@ def demo(
     report_md_path = report_path.with_name("report.md")
     write_report_md(report, report_md_path)
     timings["report"] = (time.perf_counter() - report_start) * 1000
+    timings["total"] = (time.perf_counter() - total_start) * 1000
     report.setdefault("observability", {}).setdefault("timing_ms", {})["report"] = round(
         timings["report"], 3
+    )
+    report.setdefault("observability", {}).setdefault("timing_ms", {})["total"] = round(
+        timings["total"], 3
     )
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     typer.echo(
@@ -131,3 +184,10 @@ def demo(
             ensure_ascii=False,
         )
     )
+    if _should_fail(
+        fail_on=fail_on,
+        contract_issues=issues,
+        rule_results=rule_results,
+        anomalies=anomaly_results,
+    ):
+        raise typer.Exit(code=2)
