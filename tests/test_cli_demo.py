@@ -11,6 +11,9 @@ def test_cli_demo_runs_and_writes_reports(tmp_path: Path):
         capture_output=True,
         text=True,
     )
+    payload = json.loads(result.stdout)
+    run_record_path = Path(payload["run_record_path"])
+    assert run_record_path.exists(), f"run_record.json missing. stdout={result.stdout} stderr={result.stderr}"
     report_files = list(tmp_path.glob("*/report.json"))
     assert report_files, f"No report.json found. stdout={result.stdout} stderr={result.stderr}"
     report_md_files = list(tmp_path.glob("*/report.md"))
