@@ -1,5 +1,4 @@
 name: CI
-
 on:
   push:
   pull_request:
@@ -23,8 +22,10 @@ jobs:
           python -m pip install -U pip
           pip install -e ".[test]"
 
-      - name: Smoke demo
-        run: python -m dq_agent demo
+      - name: Smoke replay gate
+        run: |
+          OUTPUT_DIR=/tmp/dq_artifacts bash scripts/smoke_replay.sh
 
       - name: Tests
         run: python -m pytest -q
+
