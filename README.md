@@ -39,7 +39,8 @@ A demo/run creates a new run directory:
 - `artifacts/<run_id>/report.md`
 - `artifacts/<run_id>/run_record.json` (replayable run record)
 
-`report.json` includes an `observability` section with timing and rule/anomaly counts.
+`report.json` and `run_record.json` include `schema_version: 1` at the top level. `report.json` includes an
+`observability` section with timing and rule/anomaly counts.
 
 Sample outputs (committed for quick preview):
 
@@ -82,6 +83,22 @@ After a run completes, use the `run_record.json` to replay deterministically:
 
 ```bash
 python -m dq_agent replay --run-record artifacts/<run_id>/run_record.json --strict
+```
+
+## Schema + validation
+
+Print JSON Schema for each output:
+
+```bash
+python -m dq_agent schema --kind report
+python -m dq_agent schema --kind run_record
+```
+
+Validate a generated output:
+
+```bash
+python -m dq_agent validate --kind report --path artifacts/<run_id>/report.json
+python -m dq_agent validate --kind run_record --path artifacts/<run_id>/run_record.json
 ```
 
 ## Config format (YAML)

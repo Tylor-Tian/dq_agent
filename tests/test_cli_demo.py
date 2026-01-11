@@ -20,6 +20,7 @@ def test_cli_demo_runs_and_writes_reports(tmp_path: Path):
     assert report_md_files, f"No report.md found. stdout={result.stdout} stderr={result.stderr}"
     report = json.loads(report_files[0].read_text(encoding="utf-8"))
     required_keys = {
+        "schema_version",
         "run_id",
         "started_at",
         "finished_at",
@@ -32,6 +33,7 @@ def test_cli_demo_runs_and_writes_reports(tmp_path: Path):
         "observability",
     }
     assert required_keys.issubset(report.keys())
+    assert report["schema_version"] == 1
     assert "run_id" in report
     assert "summary" in report
     assert "contract_issues" in report

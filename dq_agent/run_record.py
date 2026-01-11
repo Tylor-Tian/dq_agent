@@ -11,6 +11,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from dq_agent.run_record_schema import RunRecordModel
 
 @dataclass(frozen=True)
 class RunRecord:
@@ -73,19 +74,19 @@ def write_run_record(
     report_json_sha = sha256_path(report_json_path) if report_json_path.exists() else None
     report_md_sha = sha256_path(report_md_path) if report_md_path and report_md_path.exists() else None
 
-    record = {
-        "schema_version": 1,
-        "run_id": run_id,
-        "started_at": started_at.isoformat(),
-        "finished_at": finished_at.isoformat(),
-        "command": command,
-        "argv": argv,
-        "input": {
+    record = RunRecordModel(
+        schema_version=1,
+        run_id=run_id,
+        started_at=started_at,
+        finished_at=finished_at,
+        command=command,
+        argv=argv,
+        input={
             "data_path": str(data_path) if data_path else None,
             "config_path": str(config_path) if config_path else None,
             "output_dir": str(output_dir) if output_dir else None,
         },
-        "fingerprints": {
+        fingerprints={
             "data_sha256": data_sha,
             "config_sha256": config_sha,
             "git_sha": get_git_sha(),
@@ -93,22 +94,24 @@ def write_run_record(
             "platform": platform.platform(),
             "dq_agent_version": get_dq_agent_version(),
         },
-        "outputs": {
+        outputs={
             "report_json_path": str(report_json_path),
             "report_md_path": str(report_md_path) if report_md_path else None,
             "report_json_sha256": report_json_sha,
             "report_md_sha256": report_md_sha,
         },
-    }
-    run_record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    )
+    run_record_path.write_text(
+        json.dumps(record.model_dump(mode="json"), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return run_record_path
 
 
 def load_run_record(path: Path) -> RunRecord:
     data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("schema_version") != 1:
-        raise ValueError("Invalid run record schema.")
-    return RunRecord(data=data)
+    model = RunRecordModel.model_validate(data)
+    return RunRecord(data=model.model_dump(mode="json"))
 
 
 def _canonicalize(value: Any) -> Any:

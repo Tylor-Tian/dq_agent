@@ -1,19 +1,23 @@
 import json
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 import typer
+from pydantic import ValidationError
 
 from dq_agent.config import load_config
 from dq_agent.contract import validate_contract
 from dq_agent.demo.generate_demo_data import generate_demo_data
 from dq_agent.loader import load_table
 from dq_agent.report.writer_md import write_report_md
-from dq_agent.report.writer_json import write_report_json
+from dq_agent.report.schema import Report
+from dq_agent.report.writer_json import build_report_model, write_report_json
+from dq_agent.run_record_schema import RunRecordModel
 from dq_agent.anomalies import run_anomalies
 from dq_agent.rules import run_rules
 from dq_agent.run_record import compare_reports, load_run_record, sha256_path, write_run_record
@@ -23,6 +27,19 @@ class FailOn(str, Enum):
     info = "INFO"
     warn = "WARN"
     error = "ERROR"
+
+
+class SchemaKind(str, Enum):
+    report = "report"
+    run_record = "run_record"
+
+
+def _get_schema_model(kind: SchemaKind):
+    if kind == SchemaKind.report:
+        return Report
+    if kind == SchemaKind.run_record:
+        return RunRecordModel
+    raise ValueError(f"Unsupported schema kind: {kind}")
 
 
 app = typer.Typer(add_completion=False)
@@ -53,6 +70,7 @@ def _execute_run(
     command: str,
     argv: list[str],
 ) -> tuple[Path, Path, Path, list, list, list]:
+    run_id = uuid.uuid4().hex
     run_started_at = datetime.now(timezone.utc)
     total_start = time.perf_counter()
     timings: dict[str, float] = {}
@@ -74,8 +92,13 @@ def _execute_run(
     timings["anomalies"] = (time.perf_counter() - start) * 1000
 
     report_start = time.perf_counter()
-    report_path = write_report_json(
-        output_dir=output_dir,
+    run_dir = output_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    report_path = run_dir / "report.json"
+    report_model = build_report_model(
+        run_id=run_id,
+        started_at=run_started_at,
+        finished_at=datetime.now(timezone.utc),
         data_path=data_path,
         config_path=config_path,
         rows=len(df.index),
@@ -85,21 +108,18 @@ def _execute_run(
         anomalies=anomaly_results,
         observability_timing_ms=timings,
     )
-    report = json.loads(report_path.read_text(encoding="utf-8"))
+    write_report_json(report_model, report_path)
     report_md_path = report_path.with_name("report.md")
-    write_report_md(report, report_md_path)
+    write_report_md(report_model.model_dump(mode="json"), report_md_path)
     timings["report"] = (time.perf_counter() - report_start) * 1000
     timings["total"] = (time.perf_counter() - total_start) * 1000
-    report.setdefault("observability", {}).setdefault("timing_ms", {})["report"] = round(
-        timings["report"], 3
-    )
-    report.setdefault("observability", {}).setdefault("timing_ms", {})["total"] = round(
-        timings["total"], 3
-    )
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    report_model.observability.timing_ms.report = round(timings["report"], 3)
+    report_model.observability.timing_ms.total = round(timings["total"], 3)
+    report_model.finished_at = datetime.now(timezone.utc)
+    write_report_json(report_model, report_path)
     run_finished_at = datetime.now(timezone.utc)
     run_record_path = write_run_record(
-        run_id=report.get("run_id", "unknown"),
+        run_id=run_id,
         started_at=run_started_at,
         finished_at=run_finished_at,
         command=command,
@@ -285,3 +305,43 @@ def replay(
     typer.echo(json.dumps(result, ensure_ascii=False))
     if strict and not same:
         raise typer.Exit(code=2)
+
+
+@app.command()
+def schema(
+    kind: SchemaKind = typer.Option(..., "--kind"),
+    out: Optional[Path] = typer.Option(None, "--out"),
+) -> None:
+    """Print JSON Schema for report or run_record."""
+    model = _get_schema_model(kind)
+    schema_payload = model.model_json_schema()
+    output = json.dumps(schema_payload, ensure_ascii=False, indent=2)
+    if out is None:
+        typer.echo(output)
+        return
+    out.write_text(output, encoding="utf-8")
+
+
+@app.command()
+def validate(
+    kind: SchemaKind = typer.Option(..., "--kind"),
+    path: Path = typer.Option(..., "--path"),
+) -> None:
+    """Validate a JSON file against the report or run_record schema."""
+    model = _get_schema_model(kind)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        model.model_validate(payload)
+    except FileNotFoundError as exc:
+        typer.echo(f"Failed to read {path}: {exc}", err=True)
+        raise typer.Exit(code=1)
+    except json.JSONDecodeError as exc:
+        typer.echo(f"Invalid JSON in {path}: {exc}", err=True)
+        raise typer.Exit(code=1)
+    except ValidationError as exc:
+        typer.echo(f"Validation failed: {exc}", err=True)
+        raise typer.Exit(code=2)
+    except Exception as exc:
+        typer.echo(f"Unexpected error: {exc}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo("ok")
