@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from dq_agent.guardrails import GuardrailsState
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -87,6 +88,7 @@ class Observability(StrictModel):
 class Report(StrictModel):
     schema_version: Literal[1] = Field(default=1)
     run_id: str
+    status: Literal["SUCCESS", "FAILED_GUARDRAIL", "FAILED"] = Field(default="SUCCESS")
     started_at: datetime
     finished_at: datetime
     input: ReportInput
@@ -96,3 +98,4 @@ class Report(StrictModel):
     anomalies: List[AnomalyResult]
     fix_actions: List[Dict[str, Any]]
     observability: Observability
+    guardrails: GuardrailsState

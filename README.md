@@ -59,6 +59,20 @@ Supported:
 - Data: CSV / Parquet
 - Config: YAML / JSON
 
+Guardrails (optional safety limits):
+
+```bash
+python -m dq_agent run \
+  --data path/to/table.parquet \
+  --config path/to/rules.yml \
+  --max-input-mb 50 \
+  --max-rows 500000 \
+  --max-cols 200 \
+  --max-rules 2000 \
+  --max-anomalies 200 \
+  --max-wall-time-s 30
+```
+
 Fail the run when issues reach a severity threshold:
 
 ```bash
@@ -68,7 +82,13 @@ python -m dq_agent run --data path/to/table.parquet --config path/to/rules.yml -
 Exit code behavior:
 - `0`: run completed without triggering `--fail-on`
 - `1`: config parsing or missing files
-- `2`: run completed but issues/anomalies met the `--fail-on` severity
+- `2`: guardrail violation (emits JSON error) or issues/anomalies met the `--fail-on` severity
+
+Guardrail violations emit a machine-readable JSON error, including any written output paths:
+
+```json
+{"error": {"type": "guardrail_violation", "code": "max_rows", "message": "..."}, "report_json_path": "...", "run_record_path": "..."}
+```
 
 See all CLI options:
 

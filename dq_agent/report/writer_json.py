@@ -8,6 +8,7 @@ from typing import Iterable, List, Optional
 from dq_agent.contract import ContractIssue
 from dq_agent.anomalies import AnomalyResult
 from dq_agent.rules import RuleResult
+from dq_agent.guardrails import GuardrailsConfig, GuardrailsState
 from dq_agent.report.schema import Report
 
 
@@ -31,6 +32,8 @@ def build_report_model(
     rule_results: Optional[List[RuleResult]] = None,
     anomalies: Optional[List[AnomalyResult]] = None,
     observability_timing_ms: Optional[dict[str, float]] = None,
+    status: str = "SUCCESS",
+    guardrails: Optional[GuardrailsState] = None,
 ) -> Report:
     rule_payloads = [result.to_dict() for result in (rule_results or [])]
     anomaly_payloads = [result.to_dict() for result in (anomalies or [])]
@@ -40,9 +43,11 @@ def build_report_model(
             {key: round(value, 3) for key, value in observability_timing_ms.items() if key in timing_ms}
         )
 
+    guardrails_state = guardrails or GuardrailsState(limits=GuardrailsConfig(), violations=[])
     return Report(
         schema_version=1,
         run_id=run_id,
+        status=status,
         started_at=started_at,
         finished_at=finished_at,
         input={
@@ -72,6 +77,7 @@ def build_report_model(
                 "anomalies_failed": _count_failed(anomaly_payloads),
             },
         },
+        guardrails=guardrails_state,
     )
 
 

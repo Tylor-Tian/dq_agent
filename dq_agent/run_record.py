@@ -11,6 +11,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from dq_agent.guardrails import GuardrailsState
 from dq_agent.run_record_schema import RunRecordModel
 
 @dataclass(frozen=True)
@@ -66,6 +67,7 @@ def write_run_record(
     output_dir: Optional[Path],
     report_json_path: Path,
     report_md_path: Optional[Path],
+    guardrails: GuardrailsState,
 ) -> Path:
     run_dir = report_json_path.parent
     run_record_path = run_dir / "run_record.json"
@@ -100,6 +102,7 @@ def write_run_record(
             "report_json_sha256": report_json_sha,
             "report_md_sha256": report_md_sha,
         },
+        guardrails=guardrails,
     )
     run_record_path.write_text(
         json.dumps(record.model_dump(mode="json"), ensure_ascii=False, indent=2),

@@ -7,6 +7,7 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from dq_agent.guardrails import GuardrailsState
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -44,3 +45,4 @@ class RunRecordModel(StrictModel):
     input: RunRecordInput
     fingerprints: RunRecordFingerprints
     outputs: RunRecordOutputs
+    guardrails: GuardrailsState
