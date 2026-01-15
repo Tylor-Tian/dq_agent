@@ -16,6 +16,7 @@ from dq_agent.anomalies.base import get_anomaly
 from dq_agent.config import load_config
 from dq_agent.contract import validate_contract
 from dq_agent.demo.generate_demo_data import generate_demo_data
+from dq_agent.errors import AgentError, AgentErrorType
 from dq_agent.guardrails import (
     GuardrailError,
     GuardrailsConfig,
@@ -57,14 +58,14 @@ app = typer.Typer(add_completion=False)
 
 @dataclass
 class RunExecutionResult:
-    report_path: Path
+    report_path: Optional[Path]
     report_md_path: Optional[Path]
-    run_record_path: Path
+    run_record_path: Optional[Path]
     issues: list
     rule_results: list
     anomaly_results: list
-    guardrail_violation: Optional[dict]
     status: str
+    error: Optional[AgentError]
 
 
 def _should_fail(
@@ -126,6 +127,102 @@ def _wall_time_guardrail(*, limits: GuardrailsConfig, started_at: float, enforce
     )
 
 
+def _make_guardrail_error(error: GuardrailError) -> AgentError:
+    violation = error.violation
+    return AgentError(
+        type=AgentErrorType.guardrail_violation,
+        code=violation.code,
+        message=violation.message,
+        is_retryable=False,
+        suggested_next_step="Adjust guardrail limits or reduce input size before retrying.",
+        details={"limit": violation.limit, "observed": violation.observed},
+    )
+
+
+def _make_io_error(
+    code: str,
+    message: str,
+    path: Optional[Path],
+    details: Optional[dict] = None,
+) -> AgentError:
+    payload = {"path": str(path)} if path is not None else {}
+    if details:
+        payload.update(details)
+    return AgentError(
+        type=AgentErrorType.io_error,
+        code=code,
+        message=message,
+        is_retryable=False,
+        suggested_next_step="Verify the file exists and is readable, then retry.",
+        details=payload or None,
+    )
+
+
+def _make_config_error(code: str, message: str, path: Optional[Path], details: Optional[dict] = None) -> AgentError:
+    payload = {"path": str(path)} if path is not None else {}
+    if details:
+        payload.update(details)
+    return AgentError(
+        type=AgentErrorType.config_error,
+        code=code,
+        message=message,
+        is_retryable=False,
+        suggested_next_step="Fix the config file format or schema, then retry.",
+        details=payload or None,
+    )
+
+
+def _make_schema_validation_error(code: str, details: dict) -> AgentError:
+    return AgentError(
+        type=AgentErrorType.schema_validation_error,
+        code=code,
+        message="Schema validation failed.",
+        is_retryable=False,
+        suggested_next_step="Inspect the schema validation errors and fix the output.",
+        details=details,
+    )
+
+
+def _make_internal_error(exc: Exception) -> AgentError:
+    return AgentError(
+        type=AgentErrorType.internal_error,
+        code="exception",
+        message="Unexpected error during execution.",
+        is_retryable=False,
+        suggested_next_step="Check logs for details and retry if the issue is resolved.",
+        details={"exception": exc.__class__.__name__, "message": str(exc)},
+    )
+
+
+def _exit_code_for_error(error: AgentError) -> int:
+    if error.type in {AgentErrorType.guardrail_violation, AgentErrorType.schema_validation_error}:
+        return 2
+    return 1
+
+
+def _emit_failure_payload(
+    *,
+    error: AgentError,
+    report_json_path: Optional[Path],
+    report_md_path: Optional[Path],
+    run_record_path: Optional[Path],
+) -> None:
+    payload: dict[str, object] = {"error": error.model_dump(mode="json")}
+    if report_json_path is not None:
+        payload["report_json_path"] = str(report_json_path)
+    if report_md_path is not None:
+        payload["report_md_path"] = str(report_md_path)
+    if run_record_path is not None:
+        payload["run_record_path"] = str(run_record_path)
+    typer.echo(json.dumps(payload, ensure_ascii=False))
+
+
+class ExecutionError(RuntimeError):
+    def __init__(self, error: AgentError) -> None:
+        super().__init__(error.message)
+        self.error = error
+
+
 def _execute_run(
     *,
     data_path: Path,
@@ -150,6 +247,7 @@ def _execute_run(
     run_dir.mkdir(parents=True, exist_ok=True)
     report_path = run_dir / "report.json"
     report_md_path: Optional[Path] = None
+    report_written = False
 
     try:
         if data_path.exists():
@@ -164,8 +262,49 @@ def _execute_run(
         _wall_time_guardrail(limits=guardrails, started_at=total_start, enforce=enforce_wall_time)
 
         start = time.perf_counter()
-        cfg = load_config(config_path)
-        df = load_table(data_path)
+        try:
+            cfg = load_config(config_path)
+        except FileNotFoundError:
+            raise ExecutionError(_make_io_error("config_not_found", "Config file not found.", config_path))
+        except ValidationError as exc:
+            raise ExecutionError(
+                _make_config_error("invalid_config", "Config failed schema validation.", config_path, {"errors": exc.errors()})
+            )
+        except ValueError as exc:
+            raise ExecutionError(_make_config_error("invalid_config", "Config failed to parse.", config_path, {"message": str(exc)}))
+        except Exception as exc:
+            raise ExecutionError(
+                _make_config_error(
+                    "config_read_failed",
+                    "Failed to load config.",
+                    config_path,
+                    {"exception": exc.__class__.__name__, "message": str(exc)},
+                )
+            )
+
+        try:
+            df = load_table(data_path)
+        except FileNotFoundError:
+            raise ExecutionError(_make_io_error("data_not_found", "Data file not found.", data_path))
+        except ValueError as exc:
+            raise ExecutionError(
+                _make_io_error(
+                    "unsupported_data_format",
+                    "Unsupported data format.",
+                    data_path,
+                    {"message": str(exc)},
+                )
+            )
+        except Exception as exc:
+            raise ExecutionError(
+                _make_io_error(
+                    "data_read_failed",
+                    "Failed to read data file.",
+                    data_path,
+                    {"exception": exc.__class__.__name__, "message": str(exc)},
+                )
+            )
+
         timings["load"] = (time.perf_counter() - start) * 1000
         _wall_time_guardrail(limits=guardrails, started_at=total_start, enforce=enforce_wall_time)
 
@@ -234,6 +373,7 @@ def _execute_run(
             guardrails=guardrails_state,
         )
         write_report_json(report_model, report_path)
+        report_written = True
         report_md_path = report_path.with_name("report.md")
         write_report_md(report_model.model_dump(mode="json"), report_md_path)
         timings["report"] = (time.perf_counter() - report_start) * 1000
@@ -252,9 +392,12 @@ def _execute_run(
             data_path=data_path,
             config_path=config_path,
             output_dir=output_dir,
+            run_dir=run_dir,
             report_json_path=report_path,
             report_md_path=report_md_path,
             guardrails=guardrails_state,
+            status="SUCCESS",
+            error=None,
         )
         return RunExecutionResult(
             report_path=report_path,
@@ -263,16 +406,16 @@ def _execute_run(
             issues=issues,
             rule_results=rule_results,
             anomaly_results=anomaly_results,
-            guardrail_violation=None,
             status="SUCCESS",
+            error=None,
         )
     except GuardrailError as exc:
-        guardrail_violation = exc.violation
+        error = _make_guardrail_error(exc)
         rows = int(len(df.index)) if df is not None else 0
         cols = int(len(df.columns)) if df is not None else 0
         guardrails_state = GuardrailsState(
             limits=guardrails,
-            violations=[guardrail_violation],
+            violations=[exc.violation],
             observed=guardrails_observed,
         )
         report_model = build_report_model(
@@ -289,8 +432,10 @@ def _execute_run(
             observability_timing_ms=timings,
             status="FAILED_GUARDRAIL",
             guardrails=guardrails_state,
+            error=error,
         )
         write_report_json(report_model, report_path)
+        report_written = True
         run_finished_at = datetime.now(timezone.utc)
         run_record_path = write_run_record(
             run_id=run_id,
@@ -301,9 +446,12 @@ def _execute_run(
             data_path=data_path,
             config_path=config_path,
             output_dir=output_dir,
+            run_dir=run_dir,
             report_json_path=report_path,
             report_md_path=None,
             guardrails=guardrails_state,
+            status="FAILED_GUARDRAIL",
+            error=error,
         )
         return RunExecutionResult(
             report_path=report_path,
@@ -312,8 +460,110 @@ def _execute_run(
             issues=[],
             rule_results=[],
             anomaly_results=[],
-            guardrail_violation=guardrail_violation.model_dump(mode="json"),
             status="FAILED_GUARDRAIL",
+            error=error,
+        )
+    except ExecutionError as exc:
+        error = exc.error
+        guardrails_state = GuardrailsState(
+            limits=guardrails,
+            violations=[],
+            observed=guardrails_observed,
+        )
+        run_finished_at = datetime.now(timezone.utc)
+        run_record_path = write_run_record(
+            run_id=run_id,
+            started_at=run_started_at,
+            finished_at=run_finished_at,
+            command=command,
+            argv=argv,
+            data_path=data_path,
+            config_path=config_path,
+            output_dir=output_dir,
+            run_dir=run_dir,
+            report_json_path=report_path if report_written else None,
+            report_md_path=None,
+            guardrails=guardrails_state,
+            status="FAILED",
+            error=error,
+        )
+        return RunExecutionResult(
+            report_path=report_path if report_written else None,
+            report_md_path=None,
+            run_record_path=run_record_path,
+            issues=[],
+            rule_results=[],
+            anomaly_results=[],
+            status="FAILED",
+            error=error,
+        )
+    except ValidationError as exc:
+        error = _make_schema_validation_error("pydantic_validation", {"errors": exc.errors()})
+        guardrails_state = GuardrailsState(
+            limits=guardrails,
+            violations=[],
+            observed=guardrails_observed,
+        )
+        run_finished_at = datetime.now(timezone.utc)
+        run_record_path = write_run_record(
+            run_id=run_id,
+            started_at=run_started_at,
+            finished_at=run_finished_at,
+            command=command,
+            argv=argv,
+            data_path=data_path,
+            config_path=config_path,
+            output_dir=output_dir,
+            run_dir=run_dir,
+            report_json_path=report_path if report_written else None,
+            report_md_path=None,
+            guardrails=guardrails_state,
+            status="FAILED",
+            error=error,
+        )
+        return RunExecutionResult(
+            report_path=report_path if report_written else None,
+            report_md_path=None,
+            run_record_path=run_record_path,
+            issues=[],
+            rule_results=[],
+            anomaly_results=[],
+            status="FAILED",
+            error=error,
+        )
+    except Exception as exc:
+        error = _make_internal_error(exc)
+        guardrails_state = GuardrailsState(
+            limits=guardrails,
+            violations=[],
+            observed=guardrails_observed,
+        )
+        run_finished_at = datetime.now(timezone.utc)
+        run_record_path = write_run_record(
+            run_id=run_id,
+            started_at=run_started_at,
+            finished_at=run_finished_at,
+            command=command,
+            argv=argv,
+            data_path=data_path,
+            config_path=config_path,
+            output_dir=output_dir,
+            run_dir=run_dir,
+            report_json_path=report_path if report_written else None,
+            report_md_path=None,
+            guardrails=guardrails_state,
+            status="FAILED",
+            error=error,
+        )
+        return RunExecutionResult(
+            report_path=report_path if report_written else None,
+            report_md_path=None,
+            run_record_path=run_record_path,
+            issues=[],
+            rule_results=[],
+            anomaly_results=[],
+            status="FAILED",
+            error=error,
         )
 
 
@@ -353,18 +603,14 @@ def run(
         guardrails=guardrails,
         enforce_wall_time=True,
     )
-    if result.guardrail_violation is not None:
-        payload = {
-            "error": {
-                "type": "guardrail_violation",
-                "code": result.guardrail_violation.get("code"),
-                "message": result.guardrail_violation.get("message"),
-            },
-            "report_json_path": str(result.report_path),
-            "run_record_path": str(result.run_record_path),
-        }
-        typer.echo(json.dumps(payload, ensure_ascii=False))
-        raise typer.Exit(code=2)
+    if result.error is not None:
+        _emit_failure_payload(
+            error=result.error,
+            report_json_path=result.report_path,
+            report_md_path=result.report_md_path,
+            run_record_path=result.run_record_path,
+        )
+        raise typer.Exit(code=_exit_code_for_error(result.error))
     typer.echo(
         json.dumps(
             {
@@ -424,18 +670,14 @@ def demo(
         guardrails=guardrails,
         enforce_wall_time=True,
     )
-    if result.guardrail_violation is not None:
-        payload = {
-            "error": {
-                "type": "guardrail_violation",
-                "code": result.guardrail_violation.get("code"),
-                "message": result.guardrail_violation.get("message"),
-            },
-            "report_json_path": str(result.report_path),
-            "run_record_path": str(result.run_record_path),
-        }
-        typer.echo(json.dumps(payload, ensure_ascii=False))
-        raise typer.Exit(code=2)
+    if result.error is not None:
+        _emit_failure_payload(
+            error=result.error,
+            report_json_path=result.report_path,
+            report_md_path=result.report_md_path,
+            run_record_path=result.run_record_path,
+        )
+        raise typer.Exit(code=_exit_code_for_error(result.error))
     typer.echo(
         json.dumps(
             {

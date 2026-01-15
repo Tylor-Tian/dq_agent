@@ -5,8 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from dq_agent.errors import AgentError
 from dq_agent.guardrails import GuardrailsState
 
 class StrictModel(BaseModel):
@@ -89,6 +90,7 @@ class Report(StrictModel):
     schema_version: Literal[1] = Field(default=1)
     run_id: str
     status: Literal["SUCCESS", "FAILED_GUARDRAIL", "FAILED"] = Field(default="SUCCESS")
+    error: Optional[AgentError] = None
     started_at: datetime
     finished_at: datetime
     input: ReportInput
@@ -99,3 +101,12 @@ class Report(StrictModel):
     fix_actions: List[Dict[str, Any]]
     observability: Observability
     guardrails: GuardrailsState
+
+    @model_validator(mode="after")
+    def _validate_error_presence(self) -> "Report":
+        if self.status == "SUCCESS":
+            if self.error is not None:
+                raise ValueError("error must be omitted for successful reports")
+        elif self.error is None:
+            raise ValueError("error must be set for failed reports")
+        return self

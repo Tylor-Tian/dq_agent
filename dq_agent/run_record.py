@@ -11,6 +11,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from dq_agent.errors import AgentError
 from dq_agent.guardrails import GuardrailsState
 from dq_agent.run_record_schema import RunRecordModel
 
@@ -65,20 +66,24 @@ def write_run_record(
     data_path: Optional[Path],
     config_path: Optional[Path],
     output_dir: Optional[Path],
-    report_json_path: Path,
+    run_dir: Path,
+    report_json_path: Optional[Path],
     report_md_path: Optional[Path],
     guardrails: GuardrailsState,
+    status: str,
+    error: Optional[AgentError],
 ) -> Path:
-    run_dir = report_json_path.parent
     run_record_path = run_dir / "run_record.json"
     data_sha = sha256_path(data_path) if data_path and data_path.exists() else None
     config_sha = sha256_path(config_path) if config_path and config_path.exists() else None
-    report_json_sha = sha256_path(report_json_path) if report_json_path.exists() else None
+    report_json_sha = sha256_path(report_json_path) if report_json_path and report_json_path.exists() else None
     report_md_sha = sha256_path(report_md_path) if report_md_path and report_md_path.exists() else None
 
     record = RunRecordModel(
         schema_version=1,
         run_id=run_id,
+        status=status,
+        error=error,
         started_at=started_at,
         finished_at=finished_at,
         command=command,
@@ -97,7 +102,7 @@ def write_run_record(
             "dq_agent_version": get_dq_agent_version(),
         },
         outputs={
-            "report_json_path": str(report_json_path),
+            "report_json_path": str(report_json_path) if report_json_path else None,
             "report_md_path": str(report_md_path) if report_md_path else None,
             "report_json_sha256": report_json_sha,
             "report_md_sha256": report_md_sha,
