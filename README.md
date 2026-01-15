@@ -81,13 +81,37 @@ python -m dq_agent run --data path/to/table.parquet --config path/to/rules.yml -
 
 Exit code behavior:
 - `0`: run completed without triggering `--fail-on`
-- `1`: config parsing or missing files
-- `2`: guardrail violation (emits JSON error) or issues/anomalies met the `--fail-on` severity
+- `1`: I/O or config parsing errors (missing/unreadable files, invalid config)
+- `2`: guardrail violation or schema validation failures, plus `--fail-on` severity
 
-Guardrail violations emit a machine-readable JSON error, including any written output paths:
+### Failure contract (typed errors)
+
+Failures are first-class artifacts. When a run fails, both `report.json` and `run_record.json` include an `error`
+object, and the CLI prints a JSON payload with the error and any written output paths.
+
+Error schema fields:
+- `type`: `guardrail_violation` | `io_error` | `config_error` | `schema_validation_error` | `internal_error`
+- `code`: short, stable machine code (e.g., `max_rows`, `data_not_found`, `invalid_config`)
+- `message`: stable human-readable message
+- `is_retryable`: boolean retry hint
+- `suggested_next_step`: short actionable hint
+- `details`: optional, small JSON object
+
+Failure output example:
 
 ```json
-{"error": {"type": "guardrail_violation", "code": "max_rows", "message": "..."}, "report_json_path": "...", "run_record_path": "..."}
+{
+  "error": {
+    "type": "guardrail_violation",
+    "code": "max_rows",
+    "message": "Row count 2500 exceeds limit 10.",
+    "is_retryable": false,
+    "suggested_next_step": "Adjust guardrail limits or reduce input size before retrying.",
+    "details": {"limit": 10, "observed": 2500}
+  },
+  "report_json_path": "artifacts/<run_id>/report.json",
+  "run_record_path": "artifacts/<run_id>/run_record.json"
+}
 ```
 
 See all CLI options:

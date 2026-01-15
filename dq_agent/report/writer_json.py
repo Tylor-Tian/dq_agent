@@ -5,8 +5,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from dq_agent.contract import ContractIssue
 from dq_agent.anomalies import AnomalyResult
+from dq_agent.contract import ContractIssue
+from dq_agent.errors import AgentError
 from dq_agent.rules import RuleResult
 from dq_agent.guardrails import GuardrailsConfig, GuardrailsState
 from dq_agent.report.schema import Report
@@ -34,6 +35,7 @@ def build_report_model(
     observability_timing_ms: Optional[dict[str, float]] = None,
     status: str = "SUCCESS",
     guardrails: Optional[GuardrailsState] = None,
+    error: Optional[AgentError] = None,
 ) -> Report:
     rule_payloads = [result.to_dict() for result in (rule_results or [])]
     anomaly_payloads = [result.to_dict() for result in (anomalies or [])]
@@ -48,6 +50,7 @@ def build_report_model(
         schema_version=1,
         run_id=run_id,
         status=status,
+        error=error,
         started_at=started_at,
         finished_at=finished_at,
         input={
