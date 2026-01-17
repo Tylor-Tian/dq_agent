@@ -1,4 +1,5 @@
 name: CI
+
 on:
   push:
   pull_request:
@@ -25,6 +26,10 @@ jobs:
       - name: Smoke replay gate
         run: |
           OUTPUT_DIR=/tmp/dq_artifacts bash scripts/smoke_replay.sh
+
+      - name: Smoke failure gate
+        run: |
+          OUTPUT_DIR=/tmp/dq_artifacts bash scripts/smoke_failure.sh
 
       - name: Tests
         run: python -m pytest -q
