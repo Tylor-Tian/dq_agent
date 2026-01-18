@@ -36,6 +36,7 @@ def build_report_model(
     status: str = "SUCCESS",
     guardrails: Optional[GuardrailsState] = None,
     error: Optional[AgentError] = None,
+    trace_file: Optional[str] = None,
 ) -> Report:
     rule_payloads = [result.to_dict() for result in (rule_results or [])]
     anomaly_payloads = [result.to_dict() for result in (anomalies or [])]
@@ -49,6 +50,7 @@ def build_report_model(
     return Report(
         schema_version=1,
         run_id=run_id,
+        trace_file=trace_file,
         status=status,
         error=error,
         started_at=started_at,

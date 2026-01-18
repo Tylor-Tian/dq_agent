@@ -69,6 +69,7 @@ def write_run_record(
     run_dir: Path,
     report_json_path: Optional[Path],
     report_md_path: Optional[Path],
+    trace_path: Optional[Path],
     guardrails: GuardrailsState,
     status: str,
     error: Optional[AgentError],
@@ -106,6 +107,7 @@ def write_run_record(
             "report_md_path": str(report_md_path) if report_md_path else None,
             "report_json_sha256": report_json_sha,
             "report_md_sha256": report_md_sha,
+            "trace_path": str(trace_path) if trace_path else None,
         },
         guardrails=guardrails,
     )
@@ -126,7 +128,7 @@ def _canonicalize(value: Any) -> Any:
     if isinstance(value, dict):
         cleaned: Dict[str, Any] = {}
         for key, val in value.items():
-            if key in {"run_id", "started_at", "finished_at", "duration_ms"}:
+            if key in {"run_id", "started_at", "finished_at", "duration_ms", "trace_file"}:
                 continue
             if key in {"output_dir", "run_dir"}:
                 continue

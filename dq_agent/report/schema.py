@@ -89,6 +89,7 @@ class Observability(StrictModel):
 class Report(StrictModel):
     schema_version: Literal[1] = Field(default=1)
     run_id: str
+    trace_file: Optional[str] = None
     status: Literal["SUCCESS", "FAILED_GUARDRAIL", "FAILED"] = Field(default="SUCCESS")
     error: Optional[AgentError] = None
     started_at: datetime

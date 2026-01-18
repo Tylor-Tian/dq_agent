@@ -34,6 +34,7 @@ class RunRecordOutputs(StrictModel):
     report_md_path: Optional[str] = None
     report_json_sha256: Optional[str] = None
     report_md_sha256: Optional[str] = None
+    trace_path: Optional[str] = None
 
 
 class RunRecordModel(StrictModel):
