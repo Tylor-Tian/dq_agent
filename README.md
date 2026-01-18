@@ -28,7 +28,7 @@ python -m dq_agent demo
 It prints something like:
 
 ```json
-{"report_json_path": "artifacts/<run_id>/report.json", "report_md_path": "artifacts/<run_id>/report.md", "run_record_path": "artifacts/<run_id>/run_record.json"}
+{"report_json_path": "artifacts/<run_id>/report.json", "report_md_path": "artifacts/<run_id>/report.md", "run_record_path": "artifacts/<run_id>/run_record.json", "trace_path": "artifacts/<run_id>/trace.jsonl"}
 ```
 
 ## Outputs
@@ -38,6 +38,7 @@ A demo/run creates a new run directory:
 - `artifacts/<run_id>/report.json`
 - `artifacts/<run_id>/report.md`
 - `artifacts/<run_id>/run_record.json` (replayable run record)
+- `artifacts/<run_id>/trace.jsonl` (run trace events, NDJSON)
 
 `report.json` and `run_record.json` include `schema_version: 1` at the top level. `report.json` includes an
 `observability` section with timing and rule/anomaly counts.
@@ -48,6 +49,17 @@ Sample outputs (committed for quick preview):
 - `examples/report.json`
 
 > Note: `artifacts/` is ignored by git. Use `examples/` if you want committed sample reports.
+
+### Trace file
+
+Each run writes a minimal trace log to `trace.jsonl` (newline-delimited JSON). The trace includes `run_start`,
+`stage_start`, `stage_end`, and `run_end` events with elapsed milliseconds since start.
+
+Inspect it with standard shell tools:
+
+```bash
+tail -n +1 artifacts/<run_id>/trace.jsonl | head
+```
 
 ## Run on your own data
 

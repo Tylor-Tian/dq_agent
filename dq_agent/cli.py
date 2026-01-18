@@ -32,6 +32,7 @@ from dq_agent.rules import run_rules
 from dq_agent.rules.base import get_check
 from dq_agent.run_record import compare_reports, load_run_record, sha256_path, write_run_record
 from dq_agent.run_record_schema import RunRecordModel
+from dq_agent.trace import Tracer
 
 
 class FailOn(str, Enum):
@@ -61,6 +62,7 @@ class RunExecutionResult:
     report_path: Optional[Path]
     report_md_path: Optional[Path]
     run_record_path: Optional[Path]
+    trace_path: Path
     issues: list
     rule_results: list
     anomaly_results: list
@@ -206,6 +208,7 @@ def _emit_failure_payload(
     report_json_path: Optional[Path],
     report_md_path: Optional[Path],
     run_record_path: Optional[Path],
+    trace_path: Optional[Path],
 ) -> None:
     payload: dict[str, object] = {"error": error.model_dump(mode="json")}
     if report_json_path is not None:
@@ -214,6 +217,8 @@ def _emit_failure_payload(
         payload["report_md_path"] = str(report_md_path)
     if run_record_path is not None:
         payload["run_record_path"] = str(run_record_path)
+    if trace_path is not None:
+        payload["trace_path"] = str(trace_path)
     typer.echo(json.dumps(payload, ensure_ascii=False))
 
 
@@ -246,10 +251,47 @@ def _execute_run(
     run_dir = output_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     report_path = run_dir / "report.json"
+    trace_path = run_dir / "trace.jsonl"
+    tracer = Tracer(run_id=run_id, trace_path=trace_path, start_time=total_start)
     report_md_path: Optional[Path] = None
     report_written = False
+    current_stage: Optional[str] = None
+
+    def _stage_start(stage: str, details: Optional[dict] = None) -> None:
+        nonlocal current_stage
+        current_stage = stage
+        tracer.emit(event="stage_start", stage=stage, details=details)
+
+    def _stage_end(
+        status: str = "OK",
+        details: Optional[dict] = None,
+        error: Optional[dict] = None,
+    ) -> None:
+        nonlocal current_stage
+        if current_stage is None:
+            return
+        tracer.emit(
+            event="stage_end",
+            stage=current_stage,
+            status=status,
+            details=details,
+            error=error,
+        )
+        current_stage = None
 
     try:
+        tracer.emit(
+            event="run_start",
+            status="OK",
+            details={
+                "command": command,
+                "argv": argv,
+                "data_path": str(data_path),
+                "config_path": str(config_path),
+                "output_dir": str(output_dir),
+                "guardrails": guardrails.model_dump(mode="json"),
+            },
+        )
         if data_path.exists():
             input_mb = data_path.stat().st_size / (1024 * 1024)
             guardrails_observed.input_mb = round(input_mb, 3)
@@ -261,6 +303,7 @@ def _execute_run(
             )
         _wall_time_guardrail(limits=guardrails, started_at=total_start, enforce=enforce_wall_time)
 
+        _stage_start("config", {"config_path": str(config_path)})
         start = time.perf_counter()
         try:
             cfg = load_config(config_path)
@@ -281,7 +324,9 @@ def _execute_run(
                     {"exception": exc.__class__.__name__, "message": str(exc)},
                 )
             )
+        _stage_end(status="OK")
 
+        _stage_start("load", {"data_path": str(data_path)})
         try:
             df = load_table(data_path)
         except FileNotFoundError:
@@ -304,10 +349,18 @@ def _execute_run(
                     {"exception": exc.__class__.__name__, "message": str(exc)},
                 )
             )
+        _stage_end(
+            status="OK",
+            details={
+                "rows": int(len(df.index)),
+                "cols": int(len(df.columns)),
+            },
+        )
 
         timings["load"] = (time.perf_counter() - start) * 1000
         _wall_time_guardrail(limits=guardrails, started_at=total_start, enforce=enforce_wall_time)
 
+        _stage_start("guardrails")
         guardrails_observed.rows = int(len(df.index))
         guardrails_observed.cols = int(len(df.columns))
         enforce_guardrails(
@@ -337,19 +390,29 @@ def _execute_run(
             observed=guardrails_observed.anomalies,
             message=f"Planned anomalies {guardrails_observed.anomalies} exceeds limit {guardrails.max_anomalies}.",
         )
+        _stage_end(
+            status="OK",
+            details=guardrails_observed.model_dump(mode="json"),
+        )
         _wall_time_guardrail(limits=guardrails, started_at=total_start, enforce=enforce_wall_time)
 
         start = time.perf_counter()
+        _stage_start("contract")
         issues = validate_contract(df, cfg)
         timings["contract"] = (time.perf_counter() - start) * 1000
+        _stage_end(status="OK", details={"issues": len(issues)})
 
         start = time.perf_counter()
+        _stage_start("rules")
         rule_results = run_rules(df, cfg)
         timings["rules"] = (time.perf_counter() - start) * 1000
+        _stage_end(status="OK", details={"results": len(rule_results)})
 
         start = time.perf_counter()
+        _stage_start("anomalies")
         anomaly_results = run_anomalies(df, cfg)
         timings["anomalies"] = (time.perf_counter() - start) * 1000
+        _stage_end(status="OK", details={"results": len(anomaly_results)})
 
         report_start = time.perf_counter()
         guardrails_state = GuardrailsState(
@@ -371,18 +434,25 @@ def _execute_run(
             observability_timing_ms=timings,
             status="SUCCESS",
             guardrails=guardrails_state,
+            trace_file=trace_path.name,
         )
+        _stage_start("report_json", {"report_json_path": str(report_path)})
         write_report_json(report_model, report_path)
+        _stage_end(status="OK")
         report_written = True
         report_md_path = report_path.with_name("report.md")
+        _stage_start("report_md", {"report_md_path": str(report_md_path)})
         write_report_md(report_model.model_dump(mode="json"), report_md_path)
+        _stage_end(status="OK")
         timings["report"] = (time.perf_counter() - report_start) * 1000
         timings["total"] = (time.perf_counter() - total_start) * 1000
         report_model.observability.timing_ms.report = round(timings["report"], 3)
         report_model.observability.timing_ms.total = round(timings["total"], 3)
         report_model.finished_at = datetime.now(timezone.utc)
+        report_model.trace_file = trace_path.name
         write_report_json(report_model, report_path)
         run_finished_at = datetime.now(timezone.utc)
+        _stage_start("run_record")
         run_record_path = write_run_record(
             run_id=run_id,
             started_at=run_started_at,
@@ -395,14 +465,18 @@ def _execute_run(
             run_dir=run_dir,
             report_json_path=report_path,
             report_md_path=report_md_path,
+            trace_path=trace_path,
             guardrails=guardrails_state,
             status="SUCCESS",
             error=None,
         )
+        _stage_end(status="OK")
+        tracer.emit(event="run_end", status="SUCCESS")
         return RunExecutionResult(
             report_path=report_path,
             report_md_path=report_md_path,
             run_record_path=run_record_path,
+            trace_path=trace_path,
             issues=issues,
             rule_results=rule_results,
             anomaly_results=anomaly_results,
@@ -411,6 +485,7 @@ def _execute_run(
         )
     except GuardrailError as exc:
         error = _make_guardrail_error(exc)
+        _stage_end(status="FAILED_GUARDRAIL", error=error.model_dump(mode="json"))
         rows = int(len(df.index)) if df is not None else 0
         cols = int(len(df.columns)) if df is not None else 0
         guardrails_state = GuardrailsState(
@@ -433,10 +508,14 @@ def _execute_run(
             status="FAILED_GUARDRAIL",
             guardrails=guardrails_state,
             error=error,
+            trace_file=trace_path.name,
         )
+        _stage_start("report_json", {"report_json_path": str(report_path)})
         write_report_json(report_model, report_path)
+        _stage_end(status="OK")
         report_written = True
         run_finished_at = datetime.now(timezone.utc)
+        _stage_start("run_record")
         run_record_path = write_run_record(
             run_id=run_id,
             started_at=run_started_at,
@@ -449,14 +528,18 @@ def _execute_run(
             run_dir=run_dir,
             report_json_path=report_path,
             report_md_path=None,
+            trace_path=trace_path,
             guardrails=guardrails_state,
             status="FAILED_GUARDRAIL",
             error=error,
         )
+        _stage_end(status="OK")
+        tracer.emit(event="run_end", status="FAILED_GUARDRAIL", error=error.model_dump(mode="json"))
         return RunExecutionResult(
             report_path=report_path,
             report_md_path=None,
             run_record_path=run_record_path,
+            trace_path=trace_path,
             issues=[],
             rule_results=[],
             anomaly_results=[],
@@ -465,12 +548,14 @@ def _execute_run(
         )
     except ExecutionError as exc:
         error = exc.error
+        _stage_end(status="FAILED", error=error.model_dump(mode="json"))
         guardrails_state = GuardrailsState(
             limits=guardrails,
             violations=[],
             observed=guardrails_observed,
         )
         run_finished_at = datetime.now(timezone.utc)
+        _stage_start("run_record")
         run_record_path = write_run_record(
             run_id=run_id,
             started_at=run_started_at,
@@ -483,14 +568,18 @@ def _execute_run(
             run_dir=run_dir,
             report_json_path=report_path if report_written else None,
             report_md_path=None,
+            trace_path=trace_path,
             guardrails=guardrails_state,
             status="FAILED",
             error=error,
         )
+        _stage_end(status="OK")
+        tracer.emit(event="run_end", status="FAILED", error=error.model_dump(mode="json"))
         return RunExecutionResult(
             report_path=report_path if report_written else None,
             report_md_path=None,
             run_record_path=run_record_path,
+            trace_path=trace_path,
             issues=[],
             rule_results=[],
             anomaly_results=[],
@@ -499,12 +588,14 @@ def _execute_run(
         )
     except ValidationError as exc:
         error = _make_schema_validation_error("pydantic_validation", {"errors": exc.errors()})
+        _stage_end(status="FAILED", error=error.model_dump(mode="json"))
         guardrails_state = GuardrailsState(
             limits=guardrails,
             violations=[],
             observed=guardrails_observed,
         )
         run_finished_at = datetime.now(timezone.utc)
+        _stage_start("run_record")
         run_record_path = write_run_record(
             run_id=run_id,
             started_at=run_started_at,
@@ -517,14 +608,18 @@ def _execute_run(
             run_dir=run_dir,
             report_json_path=report_path if report_written else None,
             report_md_path=None,
+            trace_path=trace_path,
             guardrails=guardrails_state,
             status="FAILED",
             error=error,
         )
+        _stage_end(status="OK")
+        tracer.emit(event="run_end", status="FAILED", error=error.model_dump(mode="json"))
         return RunExecutionResult(
             report_path=report_path if report_written else None,
             report_md_path=None,
             run_record_path=run_record_path,
+            trace_path=trace_path,
             issues=[],
             rule_results=[],
             anomaly_results=[],
@@ -533,12 +628,14 @@ def _execute_run(
         )
     except Exception as exc:
         error = _make_internal_error(exc)
+        _stage_end(status="FAILED", error=error.model_dump(mode="json"))
         guardrails_state = GuardrailsState(
             limits=guardrails,
             violations=[],
             observed=guardrails_observed,
         )
         run_finished_at = datetime.now(timezone.utc)
+        _stage_start("run_record")
         run_record_path = write_run_record(
             run_id=run_id,
             started_at=run_started_at,
@@ -551,14 +648,18 @@ def _execute_run(
             run_dir=run_dir,
             report_json_path=report_path if report_written else None,
             report_md_path=None,
+            trace_path=trace_path,
             guardrails=guardrails_state,
             status="FAILED",
             error=error,
         )
+        _stage_end(status="OK")
+        tracer.emit(event="run_end", status="FAILED", error=error.model_dump(mode="json"))
         return RunExecutionResult(
             report_path=report_path if report_written else None,
             report_md_path=None,
             run_record_path=run_record_path,
+            trace_path=trace_path,
             issues=[],
             rule_results=[],
             anomaly_results=[],
@@ -609,6 +710,7 @@ def run(
             report_json_path=result.report_path,
             report_md_path=result.report_md_path,
             run_record_path=result.run_record_path,
+            trace_path=result.trace_path,
         )
         raise typer.Exit(code=_exit_code_for_error(result.error))
     typer.echo(
@@ -617,6 +719,7 @@ def run(
                 "report_json_path": str(result.report_path),
                 "report_md_path": str(result.report_md_path),
                 "run_record_path": str(result.run_record_path),
+                "trace_path": str(result.trace_path),
             },
             ensure_ascii=False,
         )
@@ -676,6 +779,7 @@ def demo(
             report_json_path=result.report_path,
             report_md_path=result.report_md_path,
             run_record_path=result.run_record_path,
+            trace_path=result.trace_path,
         )
         raise typer.Exit(code=_exit_code_for_error(result.error))
     typer.echo(
@@ -684,6 +788,7 @@ def demo(
                 "report_json_path": str(result.report_path),
                 "report_md_path": str(result.report_md_path),
                 "run_record_path": str(result.run_record_path),
+                "trace_path": str(result.trace_path),
             },
             ensure_ascii=False,
         )
