@@ -65,6 +65,20 @@ class AnomalyResult(StrictModel):
     explanation: str
 
 
+class FixAction(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    is_proposal: Optional[bool] = None
+    confidence: Optional[float] = None
+    risk_flags: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_proposal(self) -> "FixAction":
+        if self.is_proposal is not None and self.is_proposal is not True:
+            raise ValueError("is_proposal must be true when present")
+        return self
+
+
 class TimingMs(StrictModel):
     load: float = 0.0
     contract: float = 0.0
@@ -99,7 +113,7 @@ class Report(StrictModel):
     contract_issues: List[ContractIssue]
     rule_results: List[RuleResult]
     anomalies: List[AnomalyResult]
-    fix_actions: List[Dict[str, Any]]
+    fix_actions: List[FixAction]
     observability: Observability
     guardrails: GuardrailsState
 
