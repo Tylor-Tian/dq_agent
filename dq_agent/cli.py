@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 import time
@@ -46,6 +47,12 @@ class SchemaKind(str, Enum):
     run_record = "run_record"
 
 
+class IdempotencyMode(str, Enum):
+    reuse = "reuse"
+    overwrite = "overwrite"
+    fail = "fail"
+
+
 def _get_schema_model(kind: SchemaKind):
     if kind == SchemaKind.report:
         return Report
@@ -68,6 +75,17 @@ class RunExecutionResult:
     anomaly_results: list
     status: str
     error: Optional[AgentError]
+
+
+@dataclass(frozen=True)
+class IdempotencyContext:
+    key: str
+    run_id: str
+    run_dir: Path
+    report_path: Path
+    report_md_path: Path
+    run_record_path: Path
+    trace_path: Path
 
 
 def _should_fail(
@@ -197,9 +215,141 @@ def _make_internal_error(exc: Exception) -> AgentError:
 
 
 def _exit_code_for_error(error: AgentError) -> int:
-    if error.type in {AgentErrorType.guardrail_violation, AgentErrorType.schema_validation_error}:
+    if error.type in {
+        AgentErrorType.guardrail_violation,
+        AgentErrorType.schema_validation_error,
+        AgentErrorType.idempotency_conflict,
+    }:
         return 2
     return 1
+
+
+def _make_idempotency_conflict_error(*, key: str, run_dir: Path) -> AgentError:
+    return AgentError(
+        type=AgentErrorType.idempotency_conflict,
+        code="idempotency_conflict",
+        message="Idempotency key already has artifacts.",
+        is_retryable=False,
+        suggested_next_step="Use --idempotency-mode reuse or overwrite to continue.",
+        details={"idempotency_key": key, "run_dir": str(run_dir)},
+    )
+
+
+def _idempotency_run_id(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+
+def _build_idempotency_context(*, key: str, output_dir: Path) -> IdempotencyContext:
+    run_id = _idempotency_run_id(key)
+    run_dir = output_dir / run_id
+    return IdempotencyContext(
+        key=key,
+        run_id=run_id,
+        run_dir=run_dir,
+        report_path=run_dir / "report.json",
+        report_md_path=run_dir / "report.md",
+        run_record_path=run_dir / "run_record.json",
+        trace_path=run_dir / "trace.jsonl",
+    )
+
+
+def _idempotency_artifacts_exist(ctx: IdempotencyContext) -> bool:
+    return ctx.report_path.exists() and ctx.run_record_path.exists()
+
+
+def _emit_success_payload(
+    *,
+    report_json_path: Path,
+    report_md_path: Optional[Path],
+    run_record_path: Path,
+    trace_path: Optional[Path],
+) -> None:
+    payload: dict[str, object] = {
+        "report_json_path": str(report_json_path),
+        "run_record_path": str(run_record_path),
+    }
+    if report_md_path is not None:
+        payload["report_md_path"] = str(report_md_path)
+    if trace_path is not None:
+        payload["trace_path"] = str(trace_path)
+    typer.echo(json.dumps(payload, ensure_ascii=False))
+
+
+def _emit_idempotency_reuse(ctx: IdempotencyContext) -> None:
+    report_md_path = ctx.report_md_path if ctx.report_md_path.exists() else None
+    trace_path = ctx.trace_path if ctx.trace_path.exists() else None
+    _emit_success_payload(
+        report_json_path=ctx.report_path,
+        report_md_path=report_md_path,
+        run_record_path=ctx.run_record_path,
+        trace_path=trace_path,
+    )
+
+
+def _write_idempotency_failure(
+    *,
+    ctx: IdempotencyContext,
+    data_path: Path,
+    config_path: Path,
+    output_dir: Path,
+    command: str,
+    argv: list[str],
+    guardrails: GuardrailsConfig,
+) -> RunExecutionResult:
+    ctx.run_dir.mkdir(parents=True, exist_ok=True)
+    error = _make_idempotency_conflict_error(key=ctx.key, run_dir=ctx.run_dir)
+    now = datetime.now(timezone.utc)
+    guardrails_state = GuardrailsState(
+        limits=guardrails,
+        violations=[],
+        observed=GuardrailsObserved(),
+    )
+    report_model = build_report_model(
+        run_id=ctx.run_id,
+        started_at=now,
+        finished_at=now,
+        data_path=data_path,
+        config_path=config_path,
+        rows=0,
+        cols=0,
+        contract_issues=[],
+        rule_results=[],
+        anomalies=[],
+        observability_timing_ms={},
+        status="FAILED",
+        guardrails=guardrails_state,
+        error=error,
+        trace_file=None,
+    )
+    write_report_json(report_model, ctx.report_path)
+    run_record_path = write_run_record(
+        run_id=ctx.run_id,
+        started_at=now,
+        finished_at=now,
+        command=command,
+        argv=argv,
+        data_path=data_path,
+        config_path=config_path,
+        output_dir=output_dir,
+        run_dir=ctx.run_dir,
+        report_json_path=ctx.report_path,
+        report_md_path=None,
+        trace_path=None,
+        guardrails=guardrails_state,
+        status="FAILED",
+        error=error,
+    )
+    return RunExecutionResult(
+        report_path=ctx.report_path,
+        report_md_path=None,
+        run_record_path=run_record_path,
+        trace_path=ctx.trace_path,
+        issues=[],
+        rule_results=[],
+        anomaly_results=[],
+        status="FAILED",
+        error=error,
+    )
 
 
 def _emit_failure_payload(
@@ -237,8 +387,10 @@ def _execute_run(
     argv: list[str],
     guardrails: GuardrailsConfig,
     enforce_wall_time: bool,
+    run_id: Optional[str] = None,
+    run_dir: Optional[Path] = None,
 ) -> RunExecutionResult:
-    run_id = uuid.uuid4().hex
+    run_id = run_id or uuid.uuid4().hex
     run_started_at = datetime.now(timezone.utc)
     total_start = time.perf_counter()
     timings: dict[str, float] = {}
@@ -248,7 +400,7 @@ def _execute_run(
     anomaly_results: list = []
     df = None
 
-    run_dir = output_dir / run_id
+    run_dir = run_dir or output_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     report_path = run_dir / "report.json"
     trace_path = run_dir / "trace.jsonl"
@@ -673,6 +825,12 @@ def run(
     data: Path = typer.Option(..., "--data", help="Path to CSV/Parquet data"),
     config: Path = typer.Option(..., "--config", help="Path to YAML/JSON config"),
     output_dir: Path = typer.Option(Path("artifacts"), "--output-dir"),
+    idempotency_key: Optional[str] = typer.Option(None, "--idempotency-key"),
+    idempotency_mode: IdempotencyMode = typer.Option(
+        IdempotencyMode.reuse,
+        "--idempotency-mode",
+        case_sensitive=False,
+    ),
     max_input_mb: Optional[int] = typer.Option(None, "--max-input-mb"),
     max_rows: Optional[int] = typer.Option(None, "--max-rows"),
     max_cols: Optional[int] = typer.Option(None, "--max-cols"),
@@ -695,6 +853,31 @@ def run(
         max_anomalies=max_anomalies,
         max_wall_time_s=max_wall_time_s,
     )
+    idempotency_ctx = None
+    if idempotency_key:
+        idempotency_ctx = _build_idempotency_context(key=idempotency_key, output_dir=output_dir)
+        if _idempotency_artifacts_exist(idempotency_ctx):
+            if idempotency_mode == IdempotencyMode.reuse:
+                _emit_idempotency_reuse(idempotency_ctx)
+                return
+            if idempotency_mode == IdempotencyMode.fail:
+                result = _write_idempotency_failure(
+                    ctx=idempotency_ctx,
+                    data_path=data,
+                    config_path=config,
+                    output_dir=output_dir,
+                    command="run",
+                    argv=sys.argv,
+                    guardrails=guardrails,
+                )
+                _emit_failure_payload(
+                    error=result.error,
+                    report_json_path=result.report_path,
+                    report_md_path=result.report_md_path,
+                    run_record_path=result.run_record_path,
+                    trace_path=None,
+                )
+                raise typer.Exit(code=_exit_code_for_error(result.error))
     result = _execute_run(
         data_path=data,
         config_path=config,
@@ -703,6 +886,8 @@ def run(
         argv=sys.argv,
         guardrails=guardrails,
         enforce_wall_time=True,
+        run_id=idempotency_ctx.run_id if idempotency_ctx else None,
+        run_dir=idempotency_ctx.run_dir if idempotency_ctx else None,
     )
     if result.error is not None:
         _emit_failure_payload(
@@ -713,16 +898,11 @@ def run(
             trace_path=result.trace_path,
         )
         raise typer.Exit(code=_exit_code_for_error(result.error))
-    typer.echo(
-        json.dumps(
-            {
-                "report_json_path": str(result.report_path),
-                "report_md_path": str(result.report_md_path),
-                "run_record_path": str(result.run_record_path),
-                "trace_path": str(result.trace_path),
-            },
-            ensure_ascii=False,
-        )
+    _emit_success_payload(
+        report_json_path=result.report_path,
+        report_md_path=result.report_md_path,
+        run_record_path=result.run_record_path,
+        trace_path=result.trace_path,
     )
     if _should_fail(
         fail_on=fail_on,
@@ -737,6 +917,12 @@ def run(
 def demo(
     output_dir: Path = typer.Option(Path("artifacts"), "--output-dir"),
     seed: Optional[int] = typer.Option(42, "--seed"),
+    idempotency_key: Optional[str] = typer.Option(None, "--idempotency-key"),
+    idempotency_mode: IdempotencyMode = typer.Option(
+        IdempotencyMode.reuse,
+        "--idempotency-mode",
+        case_sensitive=False,
+    ),
     max_input_mb: Optional[int] = typer.Option(None, "--max-input-mb"),
     max_rows: Optional[int] = typer.Option(None, "--max-rows"),
     max_cols: Optional[int] = typer.Option(None, "--max-cols"),
@@ -751,11 +937,6 @@ def demo(
     ),
 ) -> None:
     """Generate demo data and run the contract checks."""
-    demo_dir = output_dir / "demo"
-    demo_dir.mkdir(parents=True, exist_ok=True)
-    data_path = generate_demo_data(demo_dir, seed=seed)
-
-    config_path = Path(__file__).parent / "resources" / "demo_rules.yml"
     guardrails = GuardrailsConfig(
         max_input_mb=max_input_mb,
         max_rows=max_rows,
@@ -764,6 +945,37 @@ def demo(
         max_anomalies=max_anomalies,
         max_wall_time_s=max_wall_time_s,
     )
+    demo_dir = output_dir / "demo"
+    data_path = demo_dir / "orders.parquet"
+    config_path = Path(__file__).parent / "resources" / "demo_rules.yml"
+    idempotency_ctx = None
+    if idempotency_key:
+        idempotency_ctx = _build_idempotency_context(key=idempotency_key, output_dir=output_dir)
+        if _idempotency_artifacts_exist(idempotency_ctx):
+            if idempotency_mode == IdempotencyMode.reuse:
+                _emit_idempotency_reuse(idempotency_ctx)
+                return
+            if idempotency_mode == IdempotencyMode.fail:
+                result = _write_idempotency_failure(
+                    ctx=idempotency_ctx,
+                    data_path=data_path,
+                    config_path=config_path,
+                    output_dir=output_dir,
+                    command="demo",
+                    argv=sys.argv,
+                    guardrails=guardrails,
+                )
+                _emit_failure_payload(
+                    error=result.error,
+                    report_json_path=result.report_path,
+                    report_md_path=result.report_md_path,
+                    run_record_path=result.run_record_path,
+                    trace_path=None,
+                )
+                raise typer.Exit(code=_exit_code_for_error(result.error))
+
+    demo_dir.mkdir(parents=True, exist_ok=True)
+    data_path = generate_demo_data(demo_dir, seed=seed)
     result = _execute_run(
         data_path=data_path,
         config_path=config_path,
@@ -772,6 +984,8 @@ def demo(
         argv=sys.argv,
         guardrails=guardrails,
         enforce_wall_time=True,
+        run_id=idempotency_ctx.run_id if idempotency_ctx else None,
+        run_dir=idempotency_ctx.run_dir if idempotency_ctx else None,
     )
     if result.error is not None:
         _emit_failure_payload(
@@ -782,16 +996,11 @@ def demo(
             trace_path=result.trace_path,
         )
         raise typer.Exit(code=_exit_code_for_error(result.error))
-    typer.echo(
-        json.dumps(
-            {
-                "report_json_path": str(result.report_path),
-                "report_md_path": str(result.report_md_path),
-                "run_record_path": str(result.run_record_path),
-                "trace_path": str(result.trace_path),
-            },
-            ensure_ascii=False,
-        )
+    _emit_success_payload(
+        report_json_path=result.report_path,
+        report_md_path=result.report_md_path,
+        run_record_path=result.run_record_path,
+        trace_path=result.trace_path,
     )
     if _should_fail(
         fail_on=fail_on,

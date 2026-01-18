@@ -20,6 +20,16 @@ def _count_failed(items: Iterable[dict], status_key: str = "status") -> int:
     return sum(1 for item in items if item.get(status_key) == "FAIL")
 
 
+def _normalize_fix_actions(fix_actions: Iterable[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for action in fix_actions:
+        payload = dict(action)
+        payload.setdefault("is_proposal", True)
+        payload.setdefault("risk_flags", [])
+        normalized.append(payload)
+    return normalized
+
+
 def build_report_model(
     *,
     run_id: str,
@@ -37,6 +47,7 @@ def build_report_model(
     guardrails: Optional[GuardrailsState] = None,
     error: Optional[AgentError] = None,
     trace_file: Optional[str] = None,
+    fix_actions: Optional[List[dict]] = None,
 ) -> Report:
     rule_payloads = [result.to_dict() for result in (rule_results or [])]
     anomaly_payloads = [result.to_dict() for result in (anomalies or [])]
@@ -72,7 +83,7 @@ def build_report_model(
         contract_issues=[issue.to_dict() for issue in contract_issues],
         rule_results=rule_payloads,
         anomalies=anomaly_payloads,
-        fix_actions=[],
+        fix_actions=_normalize_fix_actions(fix_actions or []),
         observability={
             "timing_ms": timing_ms,
             "counts": {

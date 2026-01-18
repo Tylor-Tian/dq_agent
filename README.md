@@ -25,6 +25,12 @@ Run the demo:
 python -m dq_agent demo
 ```
 
+Use idempotency keys to keep outputs stable across reruns:
+
+```bash
+python -m dq_agent demo --idempotency-key demo-001 --idempotency-mode reuse
+```
+
 It prints something like:
 
 ```json
@@ -96,13 +102,28 @@ Exit code behavior:
 - `1`: I/O or config parsing errors (missing/unreadable files, invalid config)
 - `2`: guardrail violation or schema validation failures, plus `--fail-on` severity
 
+Idempotency controls:
+
+```bash
+python -m dq_agent run \
+  --data path/to/table.parquet \
+  --config path/to/rules.yml \
+  --idempotency-key run-001 \
+  --idempotency-mode reuse
+```
+
+Modes:
+- `reuse` (default): if `report.json` + `run_record.json` already exist for the key, return their paths and skip the pipeline.
+- `overwrite`: re-run and overwrite artifacts in the deterministic run directory.
+- `fail`: return a structured error (`idempotency_conflict`) with exit code 2 when artifacts exist.
+
 ### Failure contract (typed errors)
 
 Failures are first-class artifacts. When a run fails, both `report.json` and `run_record.json` include an `error`
 object, and the CLI prints a JSON payload with the error and any written output paths.
 
 Error schema fields:
-- `type`: `guardrail_violation` | `io_error` | `config_error` | `schema_validation_error` | `internal_error`
+- `type`: `guardrail_violation` | `io_error` | `config_error` | `schema_validation_error` | `internal_error` | `idempotency_conflict`
 - `code`: short, stable machine code (e.g., `max_rows`, `data_not_found`, `invalid_config`)
 - `message`: stable human-readable message
 - `is_retryable`: boolean retry hint
