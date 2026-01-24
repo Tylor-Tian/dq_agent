@@ -19,6 +19,7 @@ class AgentErrorType(str, Enum):
     schema_validation_error = "schema_validation_error"
     internal_error = "internal_error"
     idempotency_conflict = "idempotency_conflict"
+    regression = "regression"
 
 
 class AgentError(StrictModel):
