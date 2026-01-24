@@ -123,7 +123,7 @@ Failures are first-class artifacts. When a run fails, both `report.json` and `ru
 object, and the CLI prints a JSON payload with the error and any written output paths.
 
 Error schema fields:
-- `type`: `guardrail_violation` | `io_error` | `config_error` | `schema_validation_error` | `internal_error` | `idempotency_conflict`
+- `type`: `guardrail_violation` | `io_error` | `config_error` | `schema_validation_error` | `internal_error` | `idempotency_conflict` | `regression`
 - `code`: short, stable machine code (e.g., `max_rows`, `data_not_found`, `invalid_config`)
 - `message`: stable human-readable message
 - `is_retryable`: boolean retry hint
@@ -153,6 +153,31 @@ See all CLI options:
 python -m dq_agent --help
 python -m dq_agent run --help
 ```
+
+## Shadow (baseline vs candidate)
+
+Compare two configs against the same data before promoting changes:
+
+```bash
+python -m dq_agent shadow \
+  --data path/to/table.parquet \
+  --baseline-config path/to/baseline.yml \
+  --candidate-config path/to/candidate.yml \
+  --fail-on-regression
+```
+
+Outputs are grouped under one shadow run directory:
+
+```
+artifacts/<shadow_run_id>/
+  baseline/<baseline_run_id>/...
+  candidate/<candidate_run_id>/...
+  shadow_diff.json
+```
+
+The `--fail-on-regression` flag exits with code `2` when the candidate is worse than the baseline, while still
+writing `shadow_diff.json` and both run artifacts. The CLI prints a single JSON payload with the baseline and
+candidate report paths plus any typed error details.
 
 ## Replay a run
 

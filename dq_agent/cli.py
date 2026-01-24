@@ -33,6 +33,7 @@ from dq_agent.rules import run_rules
 from dq_agent.rules.base import get_check
 from dq_agent.run_record import compare_reports, load_run_record, sha256_path, write_run_record
 from dq_agent.run_record_schema import RunRecordModel
+from dq_agent.shadow import build_shadow_diff, load_report, write_shadow_diff
 from dq_agent.trace import Tracer
 
 
@@ -214,11 +215,34 @@ def _make_internal_error(exc: Exception) -> AgentError:
     )
 
 
+def _make_regression_error(
+    *,
+    baseline_status: str,
+    candidate_status: str,
+    baseline_issue_counts: dict,
+    candidate_issue_counts: dict,
+) -> AgentError:
+    return AgentError(
+        type=AgentErrorType.regression,
+        code="shadow_regression",
+        message="Candidate config regressed compared to baseline.",
+        is_retryable=False,
+        suggested_next_step="Inspect shadow_diff.json and adjust the candidate config before promoting.",
+        details={
+            "baseline_status": baseline_status,
+            "candidate_status": candidate_status,
+            "baseline_issue_counts": baseline_issue_counts,
+            "candidate_issue_counts": candidate_issue_counts,
+        },
+    )
+
+
 def _exit_code_for_error(error: AgentError) -> int:
     if error.type in {
         AgentErrorType.guardrail_violation,
         AgentErrorType.schema_validation_error,
         AgentErrorType.idempotency_conflict,
+        AgentErrorType.regression,
     }:
         return 2
     return 1
@@ -370,6 +394,54 @@ def _emit_failure_payload(
     if trace_path is not None:
         payload["trace_path"] = str(trace_path)
     typer.echo(json.dumps(payload, ensure_ascii=False))
+
+
+def _emit_shadow_payload(
+    *,
+    shadow_run_id: str,
+    shadow_dir: Path,
+    baseline_report_json_path: Path,
+    candidate_report_json_path: Path,
+    shadow_diff_path: Path,
+    error: Optional[AgentError],
+) -> None:
+    payload: dict[str, object] = {
+        "shadow_run_id": shadow_run_id,
+        "shadow_dir": str(shadow_dir),
+        "baseline_report_json_path": str(baseline_report_json_path),
+        "candidate_report_json_path": str(candidate_report_json_path),
+        "shadow_diff_path": str(shadow_diff_path),
+        "error": error.model_dump(mode="json") if error else None,
+    }
+    typer.echo(json.dumps(payload, ensure_ascii=False))
+
+
+def _extract_report_error(report: dict) -> Optional[AgentError]:
+    error_payload = report.get("error")
+    if not error_payload:
+        return None
+    return AgentError.model_validate(error_payload)
+
+
+def _ensure_report_md(report_path: Path) -> Optional[Path]:
+    if not report_path.exists():
+        return None
+    report_md_path = report_path.with_name("report.md")
+    if report_md_path.exists():
+        return report_md_path
+    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    write_report_md(report_payload, report_md_path)
+    return report_md_path
+
+
+def _load_report_payload(
+    report_path: Path,
+    *,
+    error_override: Optional[AgentError] = None,
+) -> tuple[dict, Optional[AgentError]]:
+    report_payload = load_report(report_path)
+    error = error_override or _extract_report_error(report_payload)
+    return report_payload, error
 
 
 class ExecutionError(RuntimeError):
@@ -666,6 +738,10 @@ def _execute_run(
         write_report_json(report_model, report_path)
         _stage_end(status="OK")
         report_written = True
+        report_md_path = report_path.with_name("report.md")
+        _stage_start("report_md", {"report_md_path": str(report_md_path)})
+        write_report_md(report_model.model_dump(mode="json"), report_md_path)
+        _stage_end(status="OK")
         run_finished_at = datetime.now(timezone.utc)
         _stage_start("run_record")
         run_record_path = write_run_record(
@@ -679,7 +755,7 @@ def _execute_run(
             output_dir=output_dir,
             run_dir=run_dir,
             report_json_path=report_path,
-            report_md_path=None,
+            report_md_path=report_md_path,
             trace_path=trace_path,
             guardrails=guardrails_state,
             status="FAILED_GUARDRAIL",
@@ -689,7 +765,7 @@ def _execute_run(
         tracer.emit(event="run_end", status="FAILED_GUARDRAIL", error=error.model_dump(mode="json"))
         return RunExecutionResult(
             report_path=report_path,
-            report_md_path=None,
+            report_md_path=report_md_path,
             run_record_path=run_record_path,
             trace_path=trace_path,
             issues=[],
@@ -706,6 +782,34 @@ def _execute_run(
             violations=[],
             observed=guardrails_observed,
         )
+        rows = int(len(df.index)) if df is not None else 0
+        cols = int(len(df.columns)) if df is not None else 0
+        if not report_written:
+            report_model = build_report_model(
+                run_id=run_id,
+                started_at=run_started_at,
+                finished_at=datetime.now(timezone.utc),
+                data_path=data_path,
+                config_path=config_path,
+                rows=rows,
+                cols=cols,
+                contract_issues=issues,
+                rule_results=rule_results,
+                anomalies=anomaly_results,
+                observability_timing_ms=timings,
+                status="FAILED",
+                guardrails=guardrails_state,
+                error=error,
+                trace_file=trace_path.name,
+            )
+            _stage_start("report_json", {"report_json_path": str(report_path)})
+            write_report_json(report_model, report_path)
+            _stage_end(status="OK")
+            report_written = True
+            report_md_path = report_path.with_name("report.md")
+            _stage_start("report_md", {"report_md_path": str(report_md_path)})
+            write_report_md(report_model.model_dump(mode="json"), report_md_path)
+            _stage_end(status="OK")
         run_finished_at = datetime.now(timezone.utc)
         _stage_start("run_record")
         run_record_path = write_run_record(
@@ -719,7 +823,7 @@ def _execute_run(
             output_dir=output_dir,
             run_dir=run_dir,
             report_json_path=report_path if report_written else None,
-            report_md_path=None,
+            report_md_path=report_md_path,
             trace_path=trace_path,
             guardrails=guardrails_state,
             status="FAILED",
@@ -729,7 +833,7 @@ def _execute_run(
         tracer.emit(event="run_end", status="FAILED", error=error.model_dump(mode="json"))
         return RunExecutionResult(
             report_path=report_path if report_written else None,
-            report_md_path=None,
+            report_md_path=report_md_path,
             run_record_path=run_record_path,
             trace_path=trace_path,
             issues=[],
@@ -1009,6 +1113,159 @@ def demo(
         anomalies=result.anomaly_results,
     ):
         raise typer.Exit(code=2)
+
+
+@app.command()
+def shadow(
+    data: Path = typer.Option(..., "--data", help="Path to CSV/Parquet data"),
+    baseline_config: Path = typer.Option(..., "--baseline-config", help="Path to baseline config"),
+    candidate_config: Path = typer.Option(..., "--candidate-config", help="Path to candidate config"),
+    output_dir: Path = typer.Option(Path("artifacts"), "--output-dir"),
+    fail_on_regression: bool = typer.Option(False, "--fail-on-regression"),
+    idempotency_key: Optional[str] = typer.Option(None, "--idempotency-key"),
+    idempotency_mode: IdempotencyMode = typer.Option(
+        IdempotencyMode.reuse,
+        "--idempotency-mode",
+        case_sensitive=False,
+    ),
+    max_input_mb: Optional[int] = typer.Option(None, "--max-input-mb"),
+    max_rows: Optional[int] = typer.Option(None, "--max-rows"),
+    max_cols: Optional[int] = typer.Option(None, "--max-cols"),
+    max_rules: Optional[int] = typer.Option(None, "--max-rules"),
+    max_anomalies: Optional[int] = typer.Option(None, "--max-anomalies"),
+    max_wall_time_s: Optional[float] = typer.Option(None, "--max-wall-time-s"),
+) -> None:
+    """Run baseline and candidate configs on the same data and compare outputs."""
+    guardrails = GuardrailsConfig(
+        max_input_mb=max_input_mb,
+        max_rows=max_rows,
+        max_cols=max_cols,
+        max_rules=max_rules,
+        max_anomalies=max_anomalies,
+        max_wall_time_s=max_wall_time_s,
+    )
+    shadow_run_id = _idempotency_run_id(idempotency_key) if idempotency_key else uuid.uuid4().hex
+    shadow_dir = output_dir / shadow_run_id
+    baseline_root = shadow_dir / "baseline"
+    candidate_root = shadow_dir / "candidate"
+    shadow_diff_path = shadow_dir / "shadow_diff.json"
+    shadow_dir.mkdir(parents=True, exist_ok=True)
+    baseline_root.mkdir(parents=True, exist_ok=True)
+    candidate_root.mkdir(parents=True, exist_ok=True)
+
+    baseline_ctx = None
+    candidate_ctx = None
+    baseline_exists = False
+    candidate_exists = False
+    if idempotency_key:
+        baseline_ctx = _build_idempotency_context(key=f"{idempotency_key}:baseline", output_dir=baseline_root)
+        candidate_ctx = _build_idempotency_context(key=f"{idempotency_key}:candidate", output_dir=candidate_root)
+        baseline_exists = _idempotency_artifacts_exist(baseline_ctx)
+        candidate_exists = _idempotency_artifacts_exist(candidate_ctx)
+        any_existing = baseline_exists or candidate_exists or shadow_diff_path.exists()
+        if idempotency_mode == IdempotencyMode.fail and any_existing:
+            error = _make_idempotency_conflict_error(key=idempotency_key, run_dir=shadow_dir)
+            _emit_shadow_payload(
+                shadow_run_id=shadow_run_id,
+                shadow_dir=shadow_dir,
+                baseline_report_json_path=baseline_ctx.report_path,
+                candidate_report_json_path=candidate_ctx.report_path,
+                shadow_diff_path=shadow_diff_path,
+                error=error,
+            )
+            raise typer.Exit(code=_exit_code_for_error(error))
+
+    def _run_or_reuse(
+        *,
+        label: str,
+        config_path: Path,
+        output_base: Path,
+        ctx: Optional[IdempotencyContext],
+        reuse_allowed: bool,
+    ) -> tuple[dict, Path, Optional[AgentError]]:
+        if ctx and reuse_allowed and _idempotency_artifacts_exist(ctx):
+            report_path = ctx.report_path
+            _ensure_report_md(report_path)
+            report_payload, error_payload = _load_report_payload(report_path)
+            return report_payload, report_path, error_payload
+        result = _execute_run(
+            data_path=data,
+            config_path=config_path,
+            output_dir=output_base,
+            command=f"shadow:{label}",
+            argv=sys.argv,
+            guardrails=guardrails,
+            enforce_wall_time=True,
+            run_id=ctx.run_id if ctx else None,
+            run_dir=ctx.run_dir if ctx else None,
+        )
+        if result.report_path is None:
+            raise RuntimeError("Missing report.json for shadow run.")
+        _ensure_report_md(result.report_path)
+        report_payload, error_payload = _load_report_payload(result.report_path, error_override=result.error)
+        return report_payload, result.report_path, error_payload
+
+    reuse_allowed = idempotency_mode == IdempotencyMode.reuse
+    baseline_report, baseline_report_path, baseline_error = _run_or_reuse(
+        label="baseline",
+        config_path=baseline_config,
+        output_base=baseline_root,
+        ctx=baseline_ctx,
+        reuse_allowed=reuse_allowed,
+    )
+    candidate_report, candidate_report_path, candidate_error = _run_or_reuse(
+        label="candidate",
+        config_path=candidate_config,
+        output_base=candidate_root,
+        ctx=candidate_ctx,
+        reuse_allowed=reuse_allowed,
+    )
+
+    shadow_diff = build_shadow_diff(
+        baseline_report=baseline_report,
+        candidate_report=candidate_report,
+        shadow_run_id=shadow_run_id,
+    )
+    write_shadow_diff(shadow_diff, shadow_diff_path)
+
+    baseline_issue_counts = (baseline_report.get("summary") or {}).get("issue_counts") or {}
+    candidate_issue_counts = (candidate_report.get("summary") or {}).get("issue_counts") or {}
+    baseline_error_count = int(baseline_issue_counts.get("error", 0) or 0)
+    candidate_error_count = int(candidate_issue_counts.get("error", 0) or 0)
+    baseline_status = str(baseline_report.get("status", "UNKNOWN"))
+    candidate_status = str(candidate_report.get("status", "UNKNOWN"))
+    regression = (
+        (baseline_status == "SUCCESS" and candidate_status.startswith("FAILED"))
+        or candidate_error_count > baseline_error_count
+    )
+
+    error: Optional[AgentError] = None
+    exit_code = 0
+    if fail_on_regression and regression:
+        error = _make_regression_error(
+            baseline_status=baseline_status,
+            candidate_status=candidate_status,
+            baseline_issue_counts=baseline_issue_counts,
+            candidate_issue_counts=candidate_issue_counts,
+        )
+        exit_code = 2
+    elif baseline_error is not None:
+        error = baseline_error
+        exit_code = _exit_code_for_error(error)
+    elif candidate_error is not None:
+        error = candidate_error
+        exit_code = _exit_code_for_error(error)
+
+    _emit_shadow_payload(
+        shadow_run_id=shadow_run_id,
+        shadow_dir=shadow_dir,
+        baseline_report_json_path=baseline_report_path,
+        candidate_report_json_path=candidate_report_path,
+        shadow_diff_path=shadow_diff_path,
+        error=error,
+    )
+    if exit_code:
+        raise typer.Exit(code=exit_code)
 
 
 @app.command()
