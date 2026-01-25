@@ -187,6 +187,25 @@ After a run completes, use the `run_record.json` to replay deterministically:
 python -m dq_agent replay --run-record artifacts/<run_id>/run_record.json --strict
 ```
 
+## Resume a run with checkpoints
+
+Each run writes a `checkpoint.json` alongside the other artifacts. If artifacts go missing, resume can repair them:
+
+```bash
+python -m dq_agent resume --run-dir artifacts/<run_id>
+```
+
+Example flow:
+
+```bash
+python -m dq_agent demo --output-dir artifacts
+rm artifacts/<run_id>/report.md
+python -m dq_agent resume --run-dir artifacts/<run_id>
+python -m dq_agent validate --kind report --path artifacts/<run_id>/report.json
+python -m dq_agent validate --kind run_record --path artifacts/<run_id>/run_record.json
+python -m dq_agent validate --kind checkpoint --path artifacts/<run_id>/checkpoint.json
+```
+
 ## Schema + validation
 
 Print JSON Schema for each output:
@@ -194,6 +213,7 @@ Print JSON Schema for each output:
 ```bash
 python -m dq_agent schema --kind report
 python -m dq_agent schema --kind run_record
+python -m dq_agent schema --kind checkpoint
 ```
 
 Validate a generated output:
@@ -201,6 +221,7 @@ Validate a generated output:
 ```bash
 python -m dq_agent validate --kind report --path artifacts/<run_id>/report.json
 python -m dq_agent validate --kind run_record --path artifacts/<run_id>/run_record.json
+python -m dq_agent validate --kind checkpoint --path artifacts/<run_id>/checkpoint.json
 ```
 
 ## Config format (YAML)
