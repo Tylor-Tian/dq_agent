@@ -14,6 +14,8 @@ from pydantic import ValidationError
 
 from dq_agent.anomalies import run_anomalies
 from dq_agent.anomalies.base import get_anomaly
+from dq_agent.checkpoint import CheckpointTracker, build_checkpoint, write_checkpoint_atomic
+from dq_agent.checkpoint_schema import CheckpointModel
 from dq_agent.config import load_config
 from dq_agent.contract import validate_contract
 from dq_agent.demo.generate_demo_data import generate_demo_data
@@ -46,6 +48,7 @@ class FailOn(str, Enum):
 class SchemaKind(str, Enum):
     report = "report"
     run_record = "run_record"
+    checkpoint = "checkpoint"
 
 
 class IdempotencyMode(str, Enum):
@@ -59,6 +62,8 @@ def _get_schema_model(kind: SchemaKind):
         return Report
     if kind == SchemaKind.run_record:
         return RunRecordModel
+    if kind == SchemaKind.checkpoint:
+        return CheckpointModel
     raise ValueError(f"Unsupported schema kind: {kind}")
 
 
@@ -71,6 +76,7 @@ class RunExecutionResult:
     report_md_path: Optional[Path]
     run_record_path: Optional[Path]
     trace_path: Path
+    checkpoint_path: Optional[Path]
     issues: list
     rule_results: list
     anomaly_results: list
@@ -87,6 +93,7 @@ class IdempotencyContext:
     report_md_path: Path
     run_record_path: Path
     trace_path: Path
+    checkpoint_path: Path
 
 
 def _should_fail(
@@ -274,6 +281,7 @@ def _build_idempotency_context(*, key: str, output_dir: Path) -> IdempotencyCont
         report_md_path=run_dir / "report.md",
         run_record_path=run_dir / "run_record.json",
         trace_path=run_dir / "trace.jsonl",
+        checkpoint_path=run_dir / "checkpoint.json",
     )
 
 
@@ -287,6 +295,7 @@ def _emit_success_payload(
     report_md_path: Optional[Path],
     run_record_path: Path,
     trace_path: Optional[Path],
+    checkpoint_path: Optional[Path],
 ) -> None:
     payload: dict[str, object] = {
         "report_json_path": str(report_json_path),
@@ -296,17 +305,21 @@ def _emit_success_payload(
         payload["report_md_path"] = str(report_md_path)
     if trace_path is not None:
         payload["trace_path"] = str(trace_path)
+    if checkpoint_path is not None:
+        payload["checkpoint_path"] = str(checkpoint_path)
     typer.echo(json.dumps(payload, ensure_ascii=False))
 
 
 def _emit_idempotency_reuse(ctx: IdempotencyContext) -> None:
     report_md_path = ctx.report_md_path if ctx.report_md_path.exists() else None
     trace_path = ctx.trace_path if ctx.trace_path.exists() else None
+    checkpoint_path = ctx.checkpoint_path if ctx.checkpoint_path.exists() else None
     _emit_success_payload(
         report_json_path=ctx.report_path,
         report_md_path=report_md_path,
         run_record_path=ctx.run_record_path,
         trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
     )
 
 
@@ -328,6 +341,29 @@ def _write_idempotency_failure(
         violations=[],
         observed=GuardrailsObserved(),
     )
+    checkpoint = build_checkpoint(
+        run_id=ctx.run_id,
+        command=command,
+        argv=argv,
+        data_path=data_path,
+        config_path=config_path,
+        output_dir=output_dir,
+        guardrails=guardrails,
+        fail_on=None,
+        idempotency_key=ctx.key,
+        idempotency_mode="fail",
+        report_path=ctx.report_path,
+        report_md_path=ctx.report_md_path,
+        run_record_path=ctx.run_record_path,
+        trace_path=ctx.trace_path,
+        checkpoint_path=ctx.checkpoint_path,
+        status="FAILED",
+    )
+    for stage_state in checkpoint.stages:
+        stage_state.status = "SKIPPED"
+    checkpoint.finished_at = now.isoformat()
+    checkpoint.updated_at = now.isoformat()
+    write_checkpoint_atomic(checkpoint, ctx.checkpoint_path)
     report_model = build_report_model(
         run_id=ctx.run_id,
         started_at=now,
@@ -368,6 +404,7 @@ def _write_idempotency_failure(
         report_md_path=None,
         run_record_path=run_record_path,
         trace_path=ctx.trace_path,
+        checkpoint_path=ctx.checkpoint_path,
         issues=[],
         rule_results=[],
         anomaly_results=[],
@@ -383,6 +420,7 @@ def _emit_failure_payload(
     report_md_path: Optional[Path],
     run_record_path: Optional[Path],
     trace_path: Optional[Path],
+    checkpoint_path: Optional[Path],
 ) -> None:
     payload: dict[str, object] = {"error": error.model_dump(mode="json")}
     if report_json_path is not None:
@@ -393,6 +431,8 @@ def _emit_failure_payload(
         payload["run_record_path"] = str(run_record_path)
     if trace_path is not None:
         payload["trace_path"] = str(trace_path)
+    if checkpoint_path is not None:
+        payload["checkpoint_path"] = str(checkpoint_path)
     typer.echo(json.dumps(payload, ensure_ascii=False))
 
 
@@ -461,6 +501,9 @@ def _execute_run(
     enforce_wall_time: bool,
     run_id: Optional[str] = None,
     run_dir: Optional[Path] = None,
+    fail_on: Optional[FailOn] = None,
+    idempotency_key: Optional[str] = None,
+    idempotency_mode: Optional[IdempotencyMode] = None,
 ) -> RunExecutionResult:
     run_id = run_id or uuid.uuid4().hex
     run_started_at = datetime.now(timezone.utc)
@@ -475,29 +518,63 @@ def _execute_run(
     run_dir = run_dir or output_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     report_path = run_dir / "report.json"
+    run_record_path = run_dir / "run_record.json"
     trace_path = run_dir / "trace.jsonl"
+    checkpoint_path = run_dir / "checkpoint.json"
+    report_md_target_path = run_dir / "report.md"
+    checkpoint = build_checkpoint(
+        run_id=run_id,
+        command=command,
+        argv=argv,
+        data_path=data_path,
+        config_path=config_path,
+        output_dir=output_dir,
+        guardrails=guardrails,
+        fail_on=fail_on.value if fail_on else None,
+        idempotency_key=idempotency_key,
+        idempotency_mode=idempotency_mode.value if idempotency_mode else None,
+        report_path=report_path,
+        report_md_path=report_md_target_path,
+        run_record_path=run_record_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    )
+    checkpoint_tracker = CheckpointTracker(
+        checkpoint=checkpoint,
+        checkpoint_path=checkpoint_path,
+        start_time=total_start,
+    )
     tracer = Tracer(run_id=run_id, trace_path=trace_path, start_time=total_start)
-    report_md_path: Optional[Path] = None
     report_written = False
+    report_md_path: Optional[Path] = None
     current_stage: Optional[str] = None
 
     def _stage_start(stage: str, details: Optional[dict] = None) -> None:
         nonlocal current_stage
         current_stage = stage
         tracer.emit(event="stage_start", stage=stage, details=details)
+        checkpoint_tracker.mark_stage_start(stage, details)
 
     def _stage_end(
         status: str = "OK",
         details: Optional[dict] = None,
-        error: Optional[dict] = None,
+        error: Optional[AgentError] = None,
     ) -> None:
         nonlocal current_stage
         if current_stage is None:
             return
+        error_payload = error.model_dump(mode="json") if error else None
+        checkpoint_status = "OK" if status == "OK" else "FAILED"
         tracer.emit(
             event="stage_end",
             stage=current_stage,
             status=status,
+            details=details,
+            error=error_payload,
+        )
+        checkpoint_tracker.mark_stage_end(
+            current_stage,
+            status=checkpoint_status,
             details=details,
             error=error,
         )
@@ -696,11 +773,13 @@ def _execute_run(
         )
         _stage_end(status="OK")
         tracer.emit(event="run_end", status="SUCCESS")
+        checkpoint_tracker.finalize(status="SUCCESS", trace_path=trace_path)
         return RunExecutionResult(
             report_path=report_path,
             report_md_path=report_md_path,
             run_record_path=run_record_path,
             trace_path=trace_path,
+            checkpoint_path=checkpoint_path,
             issues=issues,
             rule_results=rule_results,
             anomaly_results=anomaly_results,
@@ -709,7 +788,7 @@ def _execute_run(
         )
     except GuardrailError as exc:
         error = _make_guardrail_error(exc)
-        _stage_end(status="FAILED_GUARDRAIL", error=error.model_dump(mode="json"))
+        _stage_end(status="FAILED_GUARDRAIL", error=error)
         rows = int(len(df.index)) if df is not None else 0
         cols = int(len(df.columns)) if df is not None else 0
         guardrails_state = GuardrailsState(
@@ -763,11 +842,13 @@ def _execute_run(
         )
         _stage_end(status="OK")
         tracer.emit(event="run_end", status="FAILED_GUARDRAIL", error=error.model_dump(mode="json"))
+        checkpoint_tracker.finalize(status="FAILED_GUARDRAIL", error=error, trace_path=trace_path)
         return RunExecutionResult(
             report_path=report_path,
             report_md_path=report_md_path,
             run_record_path=run_record_path,
             trace_path=trace_path,
+            checkpoint_path=checkpoint_path,
             issues=[],
             rule_results=[],
             anomaly_results=[],
@@ -776,7 +857,7 @@ def _execute_run(
         )
     except ExecutionError as exc:
         error = exc.error
-        _stage_end(status="FAILED", error=error.model_dump(mode="json"))
+        _stage_end(status="FAILED", error=error)
         guardrails_state = GuardrailsState(
             limits=guardrails,
             violations=[],
@@ -831,11 +912,13 @@ def _execute_run(
         )
         _stage_end(status="OK")
         tracer.emit(event="run_end", status="FAILED", error=error.model_dump(mode="json"))
+        checkpoint_tracker.finalize(status="FAILED", error=error, trace_path=trace_path)
         return RunExecutionResult(
             report_path=report_path if report_written else None,
             report_md_path=report_md_path,
             run_record_path=run_record_path,
             trace_path=trace_path,
+            checkpoint_path=checkpoint_path,
             issues=[],
             rule_results=[],
             anomaly_results=[],
@@ -844,7 +927,7 @@ def _execute_run(
         )
     except ValidationError as exc:
         error = _make_schema_validation_error("pydantic_validation", {"errors": exc.errors()})
-        _stage_end(status="FAILED", error=error.model_dump(mode="json"))
+        _stage_end(status="FAILED", error=error)
         guardrails_state = GuardrailsState(
             limits=guardrails,
             violations=[],
@@ -871,11 +954,13 @@ def _execute_run(
         )
         _stage_end(status="OK")
         tracer.emit(event="run_end", status="FAILED", error=error.model_dump(mode="json"))
+        checkpoint_tracker.finalize(status="FAILED", error=error, trace_path=trace_path)
         return RunExecutionResult(
             report_path=report_path if report_written else None,
             report_md_path=None,
             run_record_path=run_record_path,
             trace_path=trace_path,
+            checkpoint_path=checkpoint_path,
             issues=[],
             rule_results=[],
             anomaly_results=[],
@@ -884,7 +969,7 @@ def _execute_run(
         )
     except Exception as exc:
         error = _make_internal_error(exc)
-        _stage_end(status="FAILED", error=error.model_dump(mode="json"))
+        _stage_end(status="FAILED", error=error)
         guardrails_state = GuardrailsState(
             limits=guardrails,
             violations=[],
@@ -911,11 +996,13 @@ def _execute_run(
         )
         _stage_end(status="OK")
         tracer.emit(event="run_end", status="FAILED", error=error.model_dump(mode="json"))
+        checkpoint_tracker.finalize(status="FAILED", error=error, trace_path=trace_path)
         return RunExecutionResult(
             report_path=report_path if report_written else None,
             report_md_path=None,
             run_record_path=run_record_path,
             trace_path=trace_path,
+            checkpoint_path=checkpoint_path,
             issues=[],
             rule_results=[],
             anomaly_results=[],
@@ -980,6 +1067,7 @@ def run(
                     report_md_path=result.report_md_path,
                     run_record_path=result.run_record_path,
                     trace_path=None,
+                    checkpoint_path=result.checkpoint_path,
                 )
                 raise typer.Exit(code=_exit_code_for_error(result.error))
     result = _execute_run(
@@ -992,6 +1080,9 @@ def run(
         enforce_wall_time=True,
         run_id=idempotency_ctx.run_id if idempotency_ctx else None,
         run_dir=idempotency_ctx.run_dir if idempotency_ctx else None,
+        fail_on=fail_on,
+        idempotency_key=idempotency_key,
+        idempotency_mode=idempotency_mode,
     )
     if result.error is not None:
         _emit_failure_payload(
@@ -1000,6 +1091,7 @@ def run(
             report_md_path=result.report_md_path,
             run_record_path=result.run_record_path,
             trace_path=result.trace_path,
+            checkpoint_path=result.checkpoint_path,
         )
         raise typer.Exit(code=_exit_code_for_error(result.error))
     _emit_success_payload(
@@ -1007,6 +1099,7 @@ def run(
         report_md_path=result.report_md_path,
         run_record_path=result.run_record_path,
         trace_path=result.trace_path,
+        checkpoint_path=result.checkpoint_path,
     )
     if _should_fail(
         fail_on=fail_on,
@@ -1075,6 +1168,7 @@ def demo(
                     report_md_path=result.report_md_path,
                     run_record_path=result.run_record_path,
                     trace_path=None,
+                    checkpoint_path=result.checkpoint_path,
                 )
                 raise typer.Exit(code=_exit_code_for_error(result.error))
 
@@ -1090,6 +1184,9 @@ def demo(
         enforce_wall_time=True,
         run_id=idempotency_ctx.run_id if idempotency_ctx else None,
         run_dir=idempotency_ctx.run_dir if idempotency_ctx else None,
+        fail_on=fail_on,
+        idempotency_key=idempotency_key,
+        idempotency_mode=idempotency_mode,
     )
     if result.error is not None:
         _emit_failure_payload(
@@ -1098,6 +1195,7 @@ def demo(
             report_md_path=result.report_md_path,
             run_record_path=result.run_record_path,
             trace_path=result.trace_path,
+            checkpoint_path=result.checkpoint_path,
         )
         raise typer.Exit(code=_exit_code_for_error(result.error))
     _emit_success_payload(
@@ -1105,6 +1203,7 @@ def demo(
         report_md_path=result.report_md_path,
         run_record_path=result.run_record_path,
         trace_path=result.trace_path,
+        checkpoint_path=result.checkpoint_path,
     )
     if _should_fail(
         fail_on=fail_on,
@@ -1198,6 +1297,8 @@ def shadow(
             enforce_wall_time=True,
             run_id=ctx.run_id if ctx else None,
             run_dir=ctx.run_dir if ctx else None,
+            idempotency_key=ctx.key if ctx else None,
+            idempotency_mode=idempotency_mode,
         )
         if result.report_path is None:
             raise RuntimeError("Missing report.json for shadow run.")
@@ -1366,12 +1467,209 @@ def replay(
         raise typer.Exit(code=2)
 
 
+def _find_checkpoint_error(checkpoint: CheckpointModel) -> Optional[AgentError]:
+    for stage in checkpoint.stages:
+        if stage.error is not None:
+            return stage.error
+    return None
+
+
+def _load_checkpoint(path: Path) -> CheckpointModel:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return CheckpointModel.model_validate(payload)
+
+
+@app.command()
+def resume(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Path to the existing run directory"),
+    force: bool = typer.Option(False, "--force", help="Force rerun even for terminal failures"),
+) -> None:
+    """Resume a run using an existing checkpoint.json."""
+    checkpoint_path = run_dir / "checkpoint.json"
+    try:
+        checkpoint = _load_checkpoint(checkpoint_path)
+    except FileNotFoundError as exc:
+        typer.echo(f"Missing checkpoint: {exc}", err=True)
+        raise typer.Exit(code=1)
+    except json.JSONDecodeError as exc:
+        typer.echo(f"Invalid JSON in checkpoint: {exc}", err=True)
+        raise typer.Exit(code=1)
+    except ValidationError as exc:
+        typer.echo(f"Checkpoint validation failed: {exc}", err=True)
+        raise typer.Exit(code=2)
+    except Exception as exc:
+        typer.echo(f"Unexpected error reading checkpoint: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    report_path = Path(checkpoint.artifacts.report_json_path or run_dir / "report.json")
+    report_md_path = Path(checkpoint.artifacts.report_md_path or run_dir / "report.md")
+    run_record_path = Path(checkpoint.artifacts.run_record_path or run_dir / "run_record.json")
+    trace_path = Path(checkpoint.artifacts.trace_path or run_dir / "trace.jsonl")
+
+    report_payload: Optional[dict] = None
+    report_model: Optional[Report] = None
+    if report_path.exists():
+        try:
+            report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+            report_model = Report.model_validate(report_payload)
+        except (json.JSONDecodeError, ValidationError):
+            report_payload = None
+            report_model = None
+
+    if checkpoint.status == "FAILED_GUARDRAIL" and not force:
+        error = _find_checkpoint_error(checkpoint)
+        if report_model is not None and report_model.error is not None:
+            error = report_model.error
+        if error is None:
+            error = AgentError(
+                type=AgentErrorType.guardrail_violation,
+                code="guardrail_failure",
+                message="Run failed guardrails; resume requires --force to rerun.",
+                is_retryable=False,
+                suggested_next_step="Adjust guardrail limits or re-run with --force to continue.",
+                details={"run_dir": str(run_dir)},
+            )
+        _emit_failure_payload(
+            error=error,
+            report_json_path=report_path if report_path.exists() else None,
+            report_md_path=report_md_path if report_md_path.exists() else None,
+            run_record_path=run_record_path if run_record_path.exists() else None,
+            trace_path=trace_path if trace_path.exists() else None,
+            checkpoint_path=checkpoint_path,
+        )
+        raise typer.Exit(code=2)
+
+    if report_model is None:
+        data_path = checkpoint.input.data_path
+        config_path = checkpoint.input.config_path
+        if not data_path or not config_path:
+            typer.echo("Checkpoint missing data_path or config_path; cannot resume.", err=True)
+            raise typer.Exit(code=1)
+        data_path_obj = Path(data_path)
+        config_path_obj = Path(config_path)
+        if not data_path_obj.exists():
+            typer.echo(f"Missing data file: {data_path_obj}", err=True)
+            raise typer.Exit(code=1)
+        if not config_path_obj.exists():
+            typer.echo(f"Missing config file: {config_path_obj}", err=True)
+            raise typer.Exit(code=1)
+        fail_on = None
+        if checkpoint.input.fail_on:
+            try:
+                fail_on = FailOn(checkpoint.input.fail_on)
+            except ValueError:
+                fail_on = None
+        idempotency_mode = None
+        if checkpoint.input.idempotency_mode:
+            try:
+                idempotency_mode = IdempotencyMode(checkpoint.input.idempotency_mode)
+            except ValueError:
+                idempotency_mode = None
+        result = _execute_run(
+            data_path=data_path_obj,
+            config_path=config_path_obj,
+            output_dir=Path(checkpoint.input.output_dir or run_dir.parent),
+            command=checkpoint.command,
+            argv=checkpoint.argv,
+            guardrails=checkpoint.input.guardrails,
+            enforce_wall_time=True,
+            run_id=checkpoint.run_id,
+            run_dir=run_dir,
+            fail_on=fail_on,
+            idempotency_key=checkpoint.input.idempotency_key,
+            idempotency_mode=idempotency_mode,
+        )
+        if result.error is not None:
+            _emit_failure_payload(
+                error=result.error,
+                report_json_path=result.report_path,
+                report_md_path=result.report_md_path,
+                run_record_path=result.run_record_path,
+                trace_path=result.trace_path,
+                checkpoint_path=result.checkpoint_path,
+            )
+            raise typer.Exit(code=_exit_code_for_error(result.error))
+        _emit_success_payload(
+            report_json_path=result.report_path,
+            report_md_path=result.report_md_path,
+            run_record_path=result.run_record_path,
+            trace_path=result.trace_path,
+            checkpoint_path=result.checkpoint_path,
+        )
+        if _should_fail(
+            fail_on=fail_on,
+            contract_issues=result.issues,
+            rule_results=result.rule_results,
+            anomalies=result.anomaly_results,
+        ):
+            raise typer.Exit(code=2)
+        return
+
+    repaired = False
+    if not report_md_path.exists() and report_payload is not None:
+        write_report_md(report_payload, report_md_path)
+        repaired = True
+
+    if not run_record_path.exists():
+        data_path = Path(checkpoint.input.data_path) if checkpoint.input.data_path else None
+        config_path = Path(checkpoint.input.config_path) if checkpoint.input.config_path else None
+        output_dir = Path(checkpoint.input.output_dir) if checkpoint.input.output_dir else run_dir.parent
+        guardrails_state = GuardrailsState.model_validate(report_payload.get("guardrails") if report_payload else {})
+        run_record_path = write_run_record(
+            run_id=checkpoint.run_id,
+            started_at=report_model.started_at,
+            finished_at=report_model.finished_at,
+            command=checkpoint.command,
+            argv=checkpoint.argv,
+            data_path=data_path,
+            config_path=config_path,
+            output_dir=output_dir,
+            run_dir=run_dir,
+            report_json_path=report_path,
+            report_md_path=report_md_path if report_md_path.exists() else None,
+            trace_path=trace_path if trace_path.exists() else None,
+            guardrails=guardrails_state,
+            status=report_model.status,
+            error=report_model.error,
+        )
+        repaired = True
+
+    if repaired:
+        now = datetime.now(timezone.utc).isoformat()
+        checkpoint.updated_at = now
+        if checkpoint.finished_at is None:
+            checkpoint.finished_at = now
+        checkpoint.status = report_model.status
+        checkpoint.artifacts.report_json_path = str(report_path)
+        checkpoint.artifacts.report_md_path = str(report_md_path) if report_md_path.exists() else None
+        checkpoint.artifacts.run_record_path = str(run_record_path) if run_record_path.exists() else None
+        checkpoint.artifacts.trace_path = str(trace_path) if trace_path.exists() else None
+        for stage in checkpoint.stages:
+            if stage.name == "report_json" and report_path.exists():
+                stage.status = "OK"
+            if stage.name == "report_md" and report_md_path.exists():
+                stage.status = "OK"
+            if stage.name == "run_record" and run_record_path.exists():
+                stage.status = "OK"
+            if stage.name == "trace" and trace_path.exists():
+                stage.status = "OK"
+        write_checkpoint_atomic(checkpoint, checkpoint_path)
+
+    _emit_success_payload(
+        report_json_path=report_path,
+        report_md_path=report_md_path if report_md_path.exists() else None,
+        run_record_path=run_record_path,
+        trace_path=trace_path if trace_path.exists() else None,
+        checkpoint_path=checkpoint_path,
+    )
+
+
 @app.command()
 def schema(
     kind: SchemaKind = typer.Option(..., "--kind"),
     out: Optional[Path] = typer.Option(None, "--out"),
 ) -> None:
-    """Print JSON Schema for report or run_record."""
+    """Print JSON Schema for report, run_record, or checkpoint."""
     model = _get_schema_model(kind)
     schema_payload = model.model_json_schema()
     output = json.dumps(schema_payload, ensure_ascii=False, indent=2)
@@ -1386,7 +1684,7 @@ def validate(
     kind: SchemaKind = typer.Option(..., "--kind"),
     path: Path = typer.Option(..., "--path"),
 ) -> None:
-    """Validate a JSON file against the report or run_record schema."""
+    """Validate a JSON file against the report, run_record, or checkpoint schema."""
     model = _get_schema_model(kind)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
