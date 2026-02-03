@@ -1,8 +1,8 @@
 dataset,rows,cols,profile,truth_err_cells,predicted,cell_f1,row_f1,truncated,metrics_path
-raha/beers,2410,9,clean,4362,5834,0.85563,1,False,/root/dq_benchmarks/out/raha_20260201_211431/beers/metrics.json
-raha/flights,2376,7,clean,4920,4606,0.967038,0.98372,False,/root/dq_benchmarks/out/raha_20260201_211431/flights/metrics.json
-raha/hospital,1000,6,clean,145,145,1,1,False,/root/dq_benchmarks/out/raha_20260201_211431/hospital/metrics.json
-raha/movies_1,7390,11,clean,1124,876,0.556,0.553936,False,/root/dq_benchmarks/out/raha_20260201_211431/movies_1/metrics.json
-raha/rayyan,1000,11,clean,873,2394,0.397306,0.867066,False,/root/dq_benchmarks/out/raha_20260201_211431/rayyan/metrics.json
-raha/tax,200000,15,clean,2566,787,0.119296,0.1224,False,/root/dq_benchmarks/out/raha_20260201_211431/tax/metrics.json
-raha/toy,6,3,clean,4,4,1,1,False,/root/dq_benchmarks/out/raha_20260201_211431/toy/metrics.json
+raha/beers,2410,9,clean,3357,4496,0.85496,1,False,/root/dq_benchmarks/out/raha_20260203_084716/beers/metrics.json
+raha/flights,2376,7,clean,4920,4666,0.960985,0.983458,False,/root/dq_benchmarks/out/raha_20260203_084716/flights/metrics.json
+raha/hospital,1000,1,clean,0,0,,,False,/root/dq_benchmarks/out/raha_20260203_084716/hospital/metrics.json
+raha/movies_1,7390,17,clean,7006,17995,0.515019,0.866797,False,/root/dq_benchmarks/out/raha_20260203_084716/movies_1/metrics.json
+raha/rayyan,1000,11,clean,948,2418,0.446821,0.882075,False,/root/dq_benchmarks/out/raha_20260203_084716/rayyan/metrics.json
+raha/tax,200000,15,clean,2966,91701,0.0169013,0.0373703,False,/root/dq_benchmarks/out/raha_20260203_084716/tax/metrics.json
+raha/toy,6,3,clean,4,4,1,1,False,/root/dq_benchmarks/out/raha_20260203_084716/toy/metrics.json
