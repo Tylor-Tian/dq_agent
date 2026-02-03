@@ -1,442 +1,316 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-Evaluate dq_agent on a (dirty.csv, clean.csv) pair with cell-level labels.
+Evaluate dq_agent on a (dirty.csv, clean.csv) pair (Raha-style).
 
-Truth labels:
-  - A cell is "error" iff dirty != clean after light normalization:
-      * strip whitespace
-      * empty string -> NA
-      * numeric coercion for numeric-like columns (so "1" == "1.0")
+Truth:
+  cells where normalized(dirty) != normalized(clean)
 
-Pred labels:
-  - Union of cell samples in dq_agent report.json where:
-      * rule_results.status == "FAIL" (or passed is False)
-      * anomalies.status == "FAIL"
+Pred:
+  cells that appear in dq_agent report FAIL rule_results/anomalies "samples"
+  (we rely on report.sample_rows being large enough to avoid truncation)
 
-Outputs under --out:
-  - dq_rules.yml        (auto-generated config)
-  - dq_raw.log          (dq_agent combined stdout/stderr)
-  - dq_out/<run_id>/... (dq_agent outputs)
-  - metrics.json        (detailed metrics)
+Key improvement for dirty-profile:
+  coverage-based categorical domains:
+    allowed_values = most frequent values covering `--domain-cover` fraction,
+    up to `--max-domain` values.
+  If coverage is too low under max-domain (high-cardinality columns), we skip
+  allowed_values for that column to avoid flooding false positives.
 
-Stdout:
-  - prints ONE json line summary (for bench scripts to append into summary.jsonl)
+Outputs:
+  - <out>/rules.yml
+  - <out>/dirty.parquet
+  - <out>/dq_out/<run_id>/report.json (via dq_agent)
+  - <out>/metrics.json
+  - one-line JSON summary to stdout (for bench scripts)
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
-import re
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+import numpy as np
 import pandas as pd
 import yaml
 
 
-# -----------------------------
-# Logging helpers
-# -----------------------------
-def eprint(*args: Any) -> None:
+Cell = Tuple[int, str]  # (row_index, column_name)
+
+
+def _eprint(*args: object) -> None:
     print(*args, file=sys.stderr)
 
 
-def mkdirp(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+def pick(d: Dict[str, Any], *keys: str) -> Any:
+    for k in keys:
+        if k in d:
+            return d[k]
+    return None
 
 
-# -----------------------------
-# CSV reading (robust enough for RAHA variants)
-# -----------------------------
-_SEP_CANDIDATES: Sequence[str] = (",", "\t", ";", "|")
+def read_csv(path: Path) -> pd.DataFrame:
+    # Keep strings as-is; avoid pandas turning empty into NaN automatically.
+    # We'll normalize ourselves.
+    df = pd.read_csv(path, dtype="string", keep_default_na=False)
+    # Drop common index columns accidentally saved.
+    drop_cols = [c for c in df.columns if str(c).startswith("Unnamed:")]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+    return df
 
 
-def _looks_like_csv_with_sep(sample: str, sep: str) -> bool:
-    # Heuristic: if sep appears multiple times in first non-empty line.
-    for line in sample.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        # ignore comment-y lines
-        if s.startswith("#"):
-            continue
-        return s.count(sep) >= 1
-    return False
-
-
-def read_csv_flexible(path: str, *, encoding: str = "utf-8") -> pd.DataFrame:
-    """
-    Read CSV with a small heuristic for weird separators.
-    We do an initial comma read; if it yields 1 column and sample hints another sep,
-    we retry with other seps and pick the one with the most columns.
-
-    We keep everything as string-ish so we can normalize ourselves.
-    """
-    # read a small sample for sep hinting
-    try:
-        with open(path, "r", encoding=encoding, errors="replace") as f:
-            sample = f.read(65536)
-    except Exception:
-        sample = ""
-
-    def _read(sep: str) -> pd.DataFrame:
-        return pd.read_csv(
-            path,
-            sep=sep,
-            engine="python",          # more tolerant
-            dtype="string",
-            keep_default_na=False,    # keep "NA" literal; we'll normalize empties ourselves
-            na_filter=False,          # keep empty as ""
-        )
-
-    df = _read(",")
-    if df.shape[1] > 1:
-        return df
-
-    # If comma gives single column, try other seps if sample suggests.
-    best_df = df
-    best_cols = df.shape[1]
-
-    for sep in _SEP_CANDIDATES:
-        if sep == ",":
-            continue
-        if sample and not _looks_like_csv_with_sep(sample, sep):
-            continue
-        try:
-            cand = _read(sep)
-        except Exception:
-            continue
-        if cand.shape[1] > best_cols:
-            best_df = cand
-            best_cols = cand.shape[1]
-
-    return best_df
-
-
-# -----------------------------
-# Column alignment (FIX for movies_1 and other mismatches)
-# -----------------------------
-_UNNAMED_RE = re.compile(r"^unnamed:\s*\d+$", re.IGNORECASE)
-
-
-def _norm_colname(x: Any) -> str:
-    """
-    Normalize column name for matching:
-      - force str
-      - strip whitespace
-      - drop BOM
-      - collapse whitespace
-      - lowercase
-    """
-    s = str(x)
-    s = s.replace("\ufeff", "")
-    s = s.strip()
-    s = re.sub(r"\s+", " ", s)
-    return s.lower()
-
-
-def _drop_unnamed(df: pd.DataFrame) -> pd.DataFrame:
-    cols = list(df.columns)
-    keep = []
-    for c in cols:
-        n = _norm_colname(c)
-        if _UNNAMED_RE.match(n):
-            continue
-        keep.append(c)
-    return df[keep].copy()
-
-
-def align_dirty_clean(
-    dirty: pd.DataFrame,
-    clean: pd.DataFrame,
-) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
-    """
-    Return (dirty_aligned, clean_aligned, notes)
-
-    Strategy:
-      1) match by normalized column names (handles int vs str, BOM, spaces)
-      2) if still no common cols, drop Unnamed:* cols and retry
-      3) if still no common cols but same column count, align by POSITION:
-         rename clean columns to dirty columns by position
-      4) else: raise with diagnostics
-    """
-    notes: List[str] = []
-
-    def _align_by_norm(d: pd.DataFrame, c: pd.DataFrame) -> Optional[Tuple[pd.DataFrame, pd.DataFrame]]:
-        d_norm = [_norm_colname(x) for x in d.columns]
-        c_norm = [_norm_colname(x) for x in c.columns]
-
-        # map norm -> original name (first occurrence)
-        d_map: Dict[str, Any] = {}
-        for orig, n in zip(d.columns, d_norm):
-            d_map.setdefault(n, orig)
-
-        c_map: Dict[str, Any] = {}
-        for orig, n in zip(c.columns, c_norm):
-            c_map.setdefault(n, orig)
-
-        common = [n for n in d_norm if n in c_map]
-        common_unique = []
-        seen = set()
-        for n in common:
-            if n in seen:
-                continue
-            seen.add(n)
-            common_unique.append(n)
-
-        if not common_unique:
-            return None
-
-        # Keep dirty order; pick corresponding clean cols; rename clean -> dirty names
-        d_cols = [d_map[n] for n in common_unique]
-        c_cols = [c_map[n] for n in common_unique]
-
-        d2 = d[d_cols].copy()
-        c2 = c[c_cols].copy()
-        rename = {c_col: d_col for c_col, d_col in zip(c_cols, d_cols) if c_col != d_col}
-        if rename:
-            notes.append(f"Aligned by normalized column names; renamed {len(rename)} clean columns to match dirty.")
-            c2 = c2.rename(columns=rename)
-        else:
-            notes.append("Aligned by normalized column names (no renames needed).")
-
-        return d2, c2
-
-    # 1) norm match
-    out = _align_by_norm(dirty, clean)
-    if out is not None:
-        d2, c2 = out
-        return d2, c2, notes
-
-    # 2) drop unnamed and retry
-    dirty2 = _drop_unnamed(dirty)
-    clean2 = _drop_unnamed(clean)
-    if dirty2.shape[1] != dirty.shape[1] or clean2.shape[1] != clean.shape[1]:
-        notes.append("Dropped Unnamed:* columns before aligning.")
-    out = _align_by_norm(dirty2, clean2)
-    if out is not None:
-        d2, c2 = out
-        return d2, c2, notes
-
-    # 3) position fallback if same width
-    if dirty2.shape[1] == clean2.shape[1] and dirty2.shape[1] > 0:
-        d_cols = list(dirty2.columns)
-        c_cols = list(clean2.columns)
-        c2 = clean2.copy()
-        c2.columns = d_cols
-        notes.append(
-            "No common column names after normalization; aligned by POSITION (renamed clean columns to dirty columns)."
-        )
-        return dirty2, c2, notes
-
-    # 4) fail with diagnostics
-    raise RuntimeError(
-        "No common columns between dirty and clean after normalization.\n"
-        f"dirty cols={len(dirty.columns)} -> after_drop={len(dirty2.columns)}\n"
-        f"clean cols={len(clean.columns)} -> after_drop={len(clean2.columns)}\n"
-        f"dirty head cols={list(dirty.columns)[:10]}\n"
-        f"clean head cols={list(clean.columns)[:10]}"
-    )
-
-
-# -----------------------------
-# Normalization + truth computation
-# -----------------------------
-_NUMERIC_RATE_THRESHOLD = 0.99
-
-
-def _normalize_string_series(s: pd.Series) -> pd.Series:
-    # s is dtype string; keep "" as "", then convert to NA
+def normalize_string_series(s: pd.Series) -> pd.Series:
+    # s is string dtype
     s2 = s.astype("string")
     s2 = s2.str.strip()
     # empty -> NA
-    s2 = s2.mask(s2 == "", pd.NA)
+    s2 = s2.replace("", pd.NA)
     return s2
 
 
-def _is_numeric_like(col: pd.Series) -> bool:
-    """
-    Decide whether a column is numeric-like based on coercion success rate.
-    """
-    s = col
-    if not pd.api.types.is_string_dtype(s.dtype):
-        s = s.astype("string")
-    s = _normalize_string_series(s)
-
-    non_na = s.notna().sum()
-    if non_na == 0:
-        return False
-
-    coerced = pd.to_numeric(s, errors="coerce")
-    ok = coerced.notna().sum()
-    rate = ok / float(non_na)
-    return rate >= _NUMERIC_RATE_THRESHOLD
+def normalize_numeric_series(s: pd.Series) -> pd.Series:
+    s2 = normalize_string_series(s)
+    # coercion
+    x = pd.to_numeric(s2, errors="coerce")
+    return x
 
 
-def normalize_pair(
-    dirty: pd.DataFrame, clean: pd.DataFrame
-) -> Tuple[pd.DataFrame, pd.DataFrame, Set[str]]:
-    """
-    Normalize both, and return numeric_cols set (by name) for aligned columns.
-    """
-    d = dirty.copy()
-    c = clean.copy()
-
-    numeric_cols: Set[str] = set()
-
-    for col in d.columns:
-        d[col] = _normalize_string_series(d[col].astype("string"))
-        c[col] = _normalize_string_series(c[col].astype("string"))
-
-    for col in d.columns:
-        # numeric-like detection based on clean (or both)
-        if _is_numeric_like(c[col]) and _is_numeric_like(d[col]):
-            numeric_cols.add(col)
-            d[col] = pd.to_numeric(d[col], errors="coerce")
-            c[col] = pd.to_numeric(c[col], errors="coerce")
-
-    return d, c, numeric_cols
+def equal_mask(a: pd.Series, b: pd.Series) -> pd.Series:
+    # True where equal; NA==NA treated as equal.
+    a_na = a.isna()
+    b_na = b.isna()
+    both_na = a_na & b_na
+    eq = (a == b)
+    # comparisons involving NA yield <NA>; treat as False
+    eq = eq.fillna(False)
+    return both_na | eq
 
 
-def compute_truth_error_cells(
-    dirty_norm: pd.DataFrame, clean_norm: pd.DataFrame, numeric_cols: Set[str]
-) -> Set[Tuple[int, str]]:
-    """
-    Return set of (row_index, column_name) where dirty != clean (NA==NA treated equal).
-    """
-    if dirty_norm.shape != clean_norm.shape:
-        raise RuntimeError(f"dirty/clean shape mismatch after alignment: {dirty_norm.shape} vs {clean_norm.shape}")
+def align_columns(dirty: pd.DataFrame, clean: pd.DataFrame, verbose: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    dcols = list(dirty.columns)
+    ccols = list(clean.columns)
+    common = [c for c in dcols if c in clean.columns]
 
-    truth: Set[Tuple[int, str]] = set()
-    nrows = dirty_norm.shape[0]
+    if common:
+        if verbose:
+            _eprint(f"[align] common columns={len(common)}")
+        dirty2 = dirty[common].copy()
+        clean2 = clean[common].copy()
+        return dirty2, clean2, common
 
-    for col in dirty_norm.columns:
-        a = dirty_norm[col]
-        b = clean_norm[col]
+    # No common columns by name: try align by position if same width.
+    if dirty.shape[1] == clean.shape[1]:
+        if verbose:
+            _eprint("[align] no common names; aligning by position")
+            _eprint("[align] dirty cols:", dcols[:10], ("..." if len(dcols) > 10 else ""))
+            _eprint("[align] clean cols:", ccols[:10], ("..." if len(ccols) > 10 else ""))
+        clean2 = clean.copy()
+        clean2.columns = dcols
+        return dirty.copy(), clean2, dcols
 
-        if col in numeric_cols:
-            # float compare; NA==NA treated equal
-            eq = a.eq(b)
-            # eq is bool series; NaN comparisons are False; fix NA==NA
-            eq = eq | (a.isna() & b.isna())
-            # vectorize indices
-            bad_idx = eq.index[~eq]
-        else:
-            # pandas StringArray eq can produce <NA> -> fill to False
-            cmp = a.eq(b)
-            if hasattr(cmp, "fillna"):
-                cmp = cmp.fillna(False)
-            eq = cmp | (a.isna() & b.isna())
-            bad_idx = eq.index[~eq]
-
-        # add tuples
-        for i in bad_idx:
-            # i is index label; in our case it's 0..n-1
-            truth.add((int(i), col))
-
-    # sanity check: ensure indices are in range
-    for i, _ in list(truth)[:5]:
-        if not (0 <= i < nrows):
-            raise RuntimeError(f"Truth error row_index out of range: {i} (nrows={nrows})")
-
-    return truth
+    raise RuntimeError(
+        "No common columns between dirty and clean, and column counts differ. "
+        f"dirty_cols={dirty.shape[1]} clean_cols={clean.shape[1]}"
+    )
 
 
-# -----------------------------
-# dq_agent config generation
-# -----------------------------
+def infer_numeric_cols(
+    profile: pd.DataFrame,
+    cols: Sequence[str],
+    numeric_success_threshold: float,
+) -> Dict[str, bool]:
+    out: Dict[str, bool] = {}
+    for c in cols:
+        s = normalize_string_series(profile[c])
+        nonnull = s.dropna()
+        if nonnull.empty:
+            out[c] = False
+            continue
+        x = pd.to_numeric(nonnull, errors="coerce")
+        success = float(x.notna().mean())
+        out[c] = success >= numeric_success_threshold
+    return out
+
+
 @dataclass
-class ConfigGenParams:
-    max_allowed_values: int = 5000
-    z_outlier_mad: float = 6.0
-    null_slack: float = 0.0  # keep strict to catch errors
+class DomainResult:
+    allowed: Optional[List[str]]
+    coverage: float
+    unique: int
+    used: bool
+    truncated: bool
+    reason: str
 
 
-def build_dq_config(
-    profile_df: pd.DataFrame,
-    numeric_cols: Set[str],
-    *,
+def coverage_domain(
+    s: pd.Series,
+    cover: float,
+    max_domain: int,
+    min_usable_coverage: float = 0.50,
+) -> DomainResult:
+    s2 = normalize_string_series(s)
+    nonnull = s2.dropna()
+    if nonnull.empty:
+        return DomainResult(allowed=None, coverage=0.0, unique=0, used=False, truncated=False, reason="empty")
+
+    vc = nonnull.value_counts(dropna=True)
+    total = int(vc.sum())
+    unique = int(vc.shape[0])
+
+    # If column is extremely high-cardinality and top-k coverage is too low,
+    # allowed_values would create massive false positives => skip.
+    topk = vc.iloc[:max_domain]
+    topk_cov = float(topk.sum()) / float(total) if total > 0 else 0.0
+    if unique > max_domain and topk_cov < min_usable_coverage:
+        return DomainResult(
+            allowed=None,
+            coverage=topk_cov,
+            unique=unique,
+            used=False,
+            truncated=True,
+            reason=f"high_cardinality(top{max_domain}_coverage={topk_cov:.3f})",
+        )
+
+    allowed: List[str] = []
+    cum = 0
+    for val, cnt in vc.items():
+        allowed.append(str(val))
+        cum += int(cnt)
+        if total > 0 and (cum / total) >= cover:
+            break
+        if len(allowed) >= max_domain:
+            break
+
+    cov = float(cum) / float(total) if total > 0 else 0.0
+    truncated = (len(allowed) < unique) and (cov < cover)
+    used = True
+    reason = "ok"
+    if unique > max_domain and truncated:
+        reason = f"truncated_to_max_domain({max_domain})"
+    elif truncated:
+        reason = "truncated_before_cover"
+
+    return DomainResult(allowed=allowed, coverage=cov, unique=unique, used=used, truncated=truncated, reason=reason)
+
+
+def build_rules_config(
     dataset_name: str,
-    sample_rows: int,
-    params: ConfigGenParams,
-) -> Dict[str, Any]:
+    profile: pd.DataFrame,
+    cols: Sequence[str],
+    is_numeric: Dict[str, bool],
+    nrows: int,
+    domain_cover: float,
+    max_domain: int,
+    z_outlier_mad: float,
+    null_slack: float,
+    verbose: bool = False,
+) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Build dq_agent YAML config dict from a profile dataframe (already normalized).
+    Returns: (config_dict, notes)
+    """
+    notes: List[str] = []
 
-    Heuristics:
-      - string columns with unique <= max_allowed_values -> allowed_values from profile unique set
-      - all columns -> not_null check with max_null_rate = profile_null_rate + slack
-      - numeric columns -> range(min,max) + outlier_mad anomaly
-      - all columns -> missing_rate anomaly
-    """
     cfg: Dict[str, Any] = {
         "version": 1,
         "dataset": {
             "name": dataset_name,
-            "primary_key": [],  # optional; RAHA datasets don't necessarily have a stable PK
+            "primary_key": ["row_id"],
         },
         "columns": {},
         "report": {
-            "sample_rows": int(sample_rows),
+            # critical: to avoid truncation in report samples for metrics computation
+            "sample_rows": int(nrows),
         },
     }
 
-    for col in profile_df.columns:
-        s = profile_df[col]
-        null_rate = float(s.isna().mean()) if len(s) else 0.0
-        max_null_rate = min(1.0, max(0.0, null_rate + params.null_slack))
+    # Always include row_id
+    cfg["columns"]["row_id"] = {
+        "type": "int",
+        "required": True,
+        "checks": [{"range": {"min": 1, "max": int(nrows)}}],
+    }
 
-        col_cfg: Dict[str, Any] = {
-            "type": "int" if col in numeric_cols else "string",
-            "required": False,
-            "checks": [
-                {"not_null": {"max_null_rate": max_null_rate}},
-            ],
-            "anomalies": [
-                {"missing_rate": {"max_rate": max_null_rate}},
-            ],
-        }
+    for c in cols:
+        # Evaluation columns exclude row_id; but config may include all.
+        col_cfg: Dict[str, Any] = {"required": True}
 
-        if col in numeric_cols:
-            # range from profile numeric values
-            s_num = pd.to_numeric(s, errors="coerce")
-            s_num = s_num.dropna()
-            if len(s_num):
-                mn = float(s_num.min())
-                mx = float(s_num.max())
-                col_cfg["checks"].append({"range": {"min": mn, "max": mx}})
-            col_cfg["anomalies"].append({"outlier_mad": {"z": float(params.z_outlier_mad)}})
+        if is_numeric.get(c, False):
+            # numeric
+            x = normalize_numeric_series(profile[c])
+            nonnull = x.dropna()
+            # If no numeric values, fallback to string
+            if nonnull.empty:
+                col_cfg["type"] = "string"
+                # minimal checks
+                col_cfg["checks"] = [{"not_null": {"max_null_rate": float(null_slack)}}]
+                col_cfg["anomalies"] = [{"missing_rate": {"max_rate": float(null_slack)}}]
+                cfg["columns"][c] = col_cfg
+                continue
+
+            # Determine int vs float
+            vals = nonnull.to_numpy()
+            is_int = np.all(np.isfinite(vals) & (np.mod(vals, 1) == 0))
+            col_cfg["type"] = "int" if bool(is_int) else "float"
+
+            # Robust range: use extreme quantiles to reduce sensitivity to rare outliers.
+            lo = float(np.nanpercentile(vals, 0.1))
+            hi = float(np.nanpercentile(vals, 99.9))
+            if lo > hi:
+                lo, hi = hi, lo
+            span = hi - lo
+            if span == 0:
+                # constant column
+                lo2, hi2 = lo, hi
+            else:
+                lo2 = lo - 0.01 * span
+                hi2 = hi + 0.01 * span
+
+            col_cfg["checks"] = [
+                {"not_null": {"max_null_rate": float(null_slack)}},
+                {"range": {"min": lo2, "max": hi2}},
+            ]
+            col_cfg["anomalies"] = [
+                {"missing_rate": {"max_rate": float(null_slack)}},
+                {"outlier_mad": {"z": float(z_outlier_mad)}},
+            ]
         else:
-            # allowed_values if feasible
-            # We use normalized values (string), excluding NA.
-            uniq = sorted(set(x for x in s.dropna().astype("string").tolist()))
-            if len(uniq) <= params.max_allowed_values:
-                col_cfg["checks"].append({"allowed_values": {"values": uniq}})
-            # else: skip allowed_values to avoid huge YAML and runtime
+            # categorical/string
+            col_cfg["type"] = "string"
+            checks: List[Dict[str, Any]] = [{"not_null": {"max_null_rate": float(null_slack)}}]
+            anomalies: List[Dict[str, Any]] = [{"missing_rate": {"max_rate": float(null_slack)}}]
 
-        cfg["columns"][col] = col_cfg
+            dom = coverage_domain(profile[c], cover=domain_cover, max_domain=max_domain)
+            if verbose:
+                _eprint(f"[domain] {c}: used={dom.used} unique={dom.unique} coverage={dom.coverage:.3f} reason={dom.reason}")
 
-    return cfg
+            if dom.used and dom.allowed:
+                checks.append({"allowed_values": {"values": dom.allowed}})
+                if dom.truncated:
+                    notes.append(f"domain_truncated:{c}:{dom.reason}:coverage={dom.coverage:.3f}:unique={dom.unique}")
+            else:
+                notes.append(f"domain_skipped:{c}:{dom.reason}:coverage={dom.coverage:.3f}:unique={dom.unique}")
+
+            col_cfg["checks"] = checks
+            col_cfg["anomalies"] = anomalies
+
+        cfg["columns"][c] = col_cfg
+
+    return cfg, notes
 
 
-# -----------------------------
-# dq_agent runner + parsing
-# -----------------------------
-def extract_last_json_obj(lines: List[str]) -> Dict[str, Any]:
+def extract_last_meta_json(raw_text: str) -> Dict[str, Any]:
     """
-    Scan from bottom to top; return the last line that's a JSON object.
-    Prefer objects containing report_json_path/run_record_path if multiple exist.
+    dq_agent prints a JSON line containing report_json_path/run_record_path.
+    We search from bottom for the last JSON object that contains these keys.
     """
-    candidates: List[Dict[str, Any]] = []
-    for line in reversed(lines):
+    for line in reversed(raw_text.splitlines()):
         s = line.strip()
         if not s:
             continue
@@ -444,415 +318,352 @@ def extract_last_json_obj(lines: List[str]) -> Dict[str, Any]:
             continue
         try:
             obj = json.loads(s)
-            if isinstance(obj, dict):
-                candidates.append(obj)
-                # best match
-                if "report_json_path" in obj and "run_record_path" in obj:
-                    return obj
         except Exception:
             continue
-
-    if candidates:
-        return candidates[0]
-    raise RuntimeError("No JSON object found in dq_agent output.")
+        if isinstance(obj, dict) and ("report_json_path" in obj) and ("run_record_path" in obj):
+            return obj
+    raise RuntimeError("No dq_agent meta JSON found in output.")
 
 
 def run_dq_agent(
-    *,
-    data_path: str,
-    config_path: str,
-    dq_out_dir: str,
-    raw_log_path: str,
+    data_path: Path,
+    config_path: Path,
+    out_dir: Path,
     fail_on: str,
-) -> Tuple[int, float, Dict[str, Any]]:
-    """
-    Run `python -m dq_agent run ...` and return (exit_code, wall_time_s, meta_json).
-    meta_json contains report_json_path, run_record_path, etc (as printed by dq_agent).
-    """
-    mkdirp(dq_out_dir)
+    raw_log_path: Path,
+) -> Tuple[Dict[str, Any], int, float, str]:
     cmd = [
         sys.executable,
         "-m",
         "dq_agent",
         "run",
         "--data",
-        data_path,
+        str(data_path),
         "--config",
-        config_path,
+        str(config_path),
         "--output-dir",
-        dq_out_dir,
+        str(out_dir),
         "--fail-on",
         fail_on,
     ]
-
     t0 = time.time()
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     t1 = time.time()
-
-    out_text = proc.stdout or ""
-    with open(raw_log_path, "w", encoding="utf-8") as f:
-        f.write(out_text)
-
-    lines = out_text.splitlines()
-    meta = extract_last_json_obj(lines)
-
-    return proc.returncode, (t1 - t0), meta
+    raw = proc.stdout
+    raw_log_path.write_text(raw, encoding="utf-8")
+    meta = extract_last_meta_json(raw)
+    return meta, int(proc.returncode), float(t1 - t0), raw
 
 
-# -----------------------------
-# Prediction extraction + truncation detection
-# -----------------------------
-def _is_fail_status(obj: Dict[str, Any]) -> bool:
-    if obj.get("status") == "FAIL":
-        return True
-    if obj.get("passed") is False:
-        return True
-    return False
-
-
-def extract_predicted_cells_from_report(
-    report: Dict[str, Any]
-) -> Tuple[Set[Tuple[int, str]], Dict[str, Any]]:
-    """
-    Predicted cells: union of (row_index, column) from FAIL rule_results/anomalies samples.
-
-    Returns:
-      (pred_cells, truncation_info)
-    """
-    pred: Set[Tuple[int, str]] = set()
-    details: List[Dict[str, Any]] = []
-    truncated = False
+def extract_predictions(report: Dict[str, Any]) -> Tuple[Set[Cell], Dict[str, Any]]:
+    pred: Set[Cell] = set()
+    trunc_details: List[Dict[str, Any]] = []
 
     # rule_results
-    for r in (report.get("rule_results") or []):
+    rr = report.get("rule_results") or []
+    for r in rr:
         if not isinstance(r, dict):
             continue
-        if not _is_fail_status(r):
+        status = r.get("status")
+        passed = r.get("passed")
+        is_fail = (status == "FAIL") or (passed is False)
+        if not is_fail:
             continue
-        col = r.get("column")
+
+        col = pick(r, "column", "col")
         if not col:
             continue
-        samples = r.get("samples") or []
-        if isinstance(samples, list):
-            for s in samples:
-                if not isinstance(s, dict):
-                    continue
-                if "row_index" not in s:
-                    continue
-                try:
-                    i = int(s["row_index"])
-                except Exception:
-                    continue
-                pred.add((i, str(col)))
 
-        # truncation heuristic for rule_results
+        samples = r.get("samples") or []
+        for s in samples:
+            if not isinstance(s, dict):
+                continue
+            idx = pick(s, "row_index", "row", "index")
+            if idx is None:
+                continue
+            pred.add((int(idx), str(col)))
+
         failed_count = r.get("failed_count")
-        if isinstance(failed_count, int) and isinstance(samples, list):
-            if len(samples) < failed_count:
-                truncated = True
-                details.append(
+        if failed_count is not None and isinstance(failed_count, (int, float)):
+            if len(samples) < int(failed_count):
+                trunc_details.append(
                     {
                         "kind": "rule_result",
                         "rule_id": r.get("rule_id"),
-                        "column": col,
-                        "failed_count": failed_count,
+                        "column": str(col),
+                        "failed_count": int(failed_count),
                         "samples": len(samples),
                     }
                 )
 
     # anomalies
-    for a in (report.get("anomalies") or []):
+    an = report.get("anomalies") or []
+    for a in an:
         if not isinstance(a, dict):
             continue
-        if a.get("status") != "FAIL":
+        status = a.get("status")
+        if status != "FAIL":
             continue
-        col = a.get("column")
+        col = pick(a, "column", "col")
         if not col:
             continue
+
         samples = a.get("samples") or []
-        if isinstance(samples, list):
-            for s in samples:
-                if not isinstance(s, dict):
-                    continue
-                if "row_index" not in s:
-                    continue
-                try:
-                    i = int(s["row_index"])
-                except Exception:
-                    continue
-                pred.add((i, str(col)))
+        for s in samples:
+            if not isinstance(s, dict):
+                continue
+            idx = pick(s, "row_index", "row", "index")
+            if idx is None:
+                continue
+            pred.add((int(idx), str(col)))
 
-        # truncation heuristic for anomalies (if we can infer expected count)
         metric = a.get("metric") or {}
-        expected = None
-        if isinstance(metric, dict):
-            if "null_count" in metric and isinstance(metric["null_count"], int):
-                expected = metric["null_count"]
-        if expected is not None and isinstance(samples, list):
-            if len(samples) < expected:
-                truncated = True
-                details.append(
-                    {
-                        "kind": "anomaly",
-                        "anomaly_id": a.get("anomaly_id"),
-                        "column": col,
-                        "expected": expected,
-                        "samples": len(samples),
-                    }
-                )
+        # best-effort truncation detection
+        for k in ("null_count", "outlier_count", "n_outliers", "num_outliers", "count_outliers"):
+            if k in metric and isinstance(metric[k], (int, float)):
+                if len(samples) < int(metric[k]):
+                    trunc_details.append(
+                        {
+                            "kind": "anomaly",
+                            "anomaly_id": a.get("anomaly_id"),
+                            "column": str(col),
+                            "metric_count_key": k,
+                            "metric_count": int(metric[k]),
+                            "samples": len(samples),
+                        }
+                    )
+                break
 
-    return pred, {"truncated": truncated, "details": details}
-
-
-# -----------------------------
-# Metrics
-# -----------------------------
-def safe_div(a: float, b: float) -> Optional[float]:
-    if b == 0:
-        return None
-    return a / b
+    trunc = {"truncated": bool(trunc_details), "details": trunc_details}
+    return pred, trunc
 
 
-def f1(p: Optional[float], r: Optional[float]) -> Optional[float]:
-    if p is None or r is None:
-        return None
-    if (p + r) == 0:
-        return 0.0
-    return 2 * p * r / (p + r)
+def compute_truth_cells(
+    dirty: pd.DataFrame,
+    clean: pd.DataFrame,
+    cols: Sequence[str],
+    is_numeric: Dict[str, bool],
+) -> Set[Cell]:
+    if len(dirty) != len(clean):
+        raise RuntimeError(f"Row count mismatch: dirty={len(dirty)} clean={len(clean)}")
+
+    truth: Set[Cell] = set()
+    for c in cols:
+        if is_numeric.get(c, False):
+            a = normalize_numeric_series(dirty[c])
+            b = normalize_numeric_series(clean[c])
+        else:
+            a = normalize_string_series(dirty[c])
+            b = normalize_string_series(clean[c])
+
+        eq = equal_mask(a, b)
+        mismatch = (~eq).to_numpy()
+        idxs = np.flatnonzero(mismatch)
+        for i in idxs:
+            truth.add((int(i), str(c)))
+
+    return truth
 
 
-def compute_prf(tp: int, fp: int, fn: int) -> Dict[str, Any]:
-    prec = safe_div(tp, tp + fp)
-    rec = safe_div(tp, tp + fn)
-    return {
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "precision": prec,
-        "recall": rec,
-        "f1": f1(prec, rec),
-    }
+def f1_from_counts(tp: int, fp: int, fn: int) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    # returns (precision, recall, f1), with None where undefined (no truth)
+    tp = int(tp); fp = int(fp); fn = int(fn)
+    pred_pos = tp + fp
+    truth_pos = tp + fn
+
+    if truth_pos == 0:
+        # no positives in truth: recall undefined
+        precision = 1.0 if pred_pos == 0 else 0.0
+        recall = None
+        f1 = None if pred_pos == 0 else 0.0
+        return precision, recall, f1
+
+    precision = tp / pred_pos if pred_pos > 0 else 0.0
+    recall = tp / truth_pos if truth_pos > 0 else 0.0
+    if (precision + recall) == 0:
+        return precision, recall, 0.0
+    return precision, recall, (2 * precision * recall / (precision + recall))
 
 
-# -----------------------------
-# Main
-# ---------------------------
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--dirty", required=True, help="Path to dirty.csv")
+    p.add_argument("--clean", required=True, help="Path to clean.csv")
+    p.add_argument("--out", required=True, help="Output directory for this dataset evaluation")
+    p.add_argument("--dataset-name", "--dataset_name", required=True, dest="dataset_name")
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(allow_abbrev=False)
+    p.add_argument("--profile-source", "--profile_source", dest="profile_source", choices=["clean", "dirty"], default="clean")
+    p.add_argument("--fail-on", "--fail_on", dest="fail_on", choices=["INFO", "WARN", "ERROR"], default="INFO")
 
-    # 兼容 bench_raha.sh 可能传入的不同参数名（hyphen / underscore / alias）
-    ap.add_argument(
-        "--dirty", "--dirty-csv", "--dirty_csv", "--dirty-path", "--dirty_path",
-        dest="dirty", required=True, help="Path to dirty.csv"
-    )
-    ap.add_argument(
-        "--clean", "--clean-csv", "--clean_csv", "--clean-path", "--clean_path",
-        dest="clean", required=True, help="Path to clean.csv"
-    )
-    ap.add_argument(
-        "--out", "--out-dir", "--out_dir", "--outdir",
-        dest="out", required=True, help="Output directory for this dataset evaluation"
-    )
-    ap.add_argument(
-        "--dataset-name", "--dataset_name", "--dataset",
-        dest="dataset_name", required=True, help="Dataset name (e.g., raha/beers)"
-    )
-    ap.add_argument(
-        "--profile-source", "--profile_source", "--profile",
-        dest="profile_source", choices=["clean", "dirty"], default="clean",
-        help="Which table to use as profiling source for rules"
-    )
-    ap.add_argument(
-        "--fail-on", "--fail_on",
-        dest="fail_on", default="INFO",
-        help="dq_agent --fail-on level (INFO/WARN/ERROR)"
-    )
+    p.add_argument("--domain-cover", "--domain_cover", dest="domain_cover", type=float, default=0.99)
+    p.add_argument("--max-domain", "--max_domain", dest="max_domain", type=int, default=2000)
+    p.add_argument("--max-allowed-values", "--max_allowed_values", dest="max_allowed_values", type=int, default=None)
 
-    ap.add_argument(
-        "--max-allowed-values", "--max_allowed_values",
-        dest="max_allowed_values", type=int, default=5000,
-        help="Max unique values for allowed_values check"
-    )
-    ap.add_argument(
-        "--z-outlier-mad", "--z_outlier_mad",
-        dest="z_outlier_mad", type=float, default=6.0,
-        help="outlier_mad z threshold"
-    )
-    ap.add_argument(
-        "--null-slack", "--null_slack",
-        dest="null_slack", type=float, default=0.0,
-        help="Allowable slack added to profile null rate"
-    )
-    ap.add_argument("--verbose", action="store_true", help="Verbose logs")
+    p.add_argument("--numeric-success-threshold", "--numeric_success_threshold",
+                   dest="numeric_success_threshold", type=float, default=0.98)
+    p.add_argument("--z-outlier-mad", "--z_outlier_mad", dest="z_outlier_mad", type=float, default=6.0)
+    p.add_argument("--null-slack", "--null_slack", dest="null_slack", type=float, default=0.02)
 
-    # 关键：不要因为 bench 传了额外参数就直接 SystemExit(2)
-    args, unknown = ap.parse_known_args(argv)
-    if unknown and getattr(args, "verbose", False):
-        eprint("[WARN] ignored unknown args:", unknown)
+    p.add_argument("--verbose", action="store_true")
 
-    return args
+    args = p.parse_args()
 
+    dirty_path = Path(args.dirty).resolve()
+    clean_path = Path(args.clean).resolve()
+    out_dir = Path(args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
+    # effective max_domain
+    max_domain = int(args.max_domain)
+    if args.max_allowed_values is not None:
+        max_domain = min(max_domain, int(args.max_allowed_values))
 
-    out_dir = os.path.abspath(args.out)
-    mkdirp(out_dir)
+    dirty_df = read_csv(dirty_path)
+    clean_df = read_csv(clean_path)
+    dirty_df, clean_df, cols = align_columns(dirty_df, clean_df, verbose=args.verbose)
 
-    rules_path = os.path.join(out_dir, "dq_rules.yml")
-    raw_log_path = os.path.join(out_dir, "dq_raw.log")
-    dq_out_dir = os.path.join(out_dir, "dq_out")
-    metrics_path = os.path.join(out_dir, "metrics.json")
+    nrows = int(len(dirty_df))
+    ncols = int(len(cols))
 
-    if args.verbose:
-        eprint(f"[eval] dirty={args.dirty}")
-        eprint(f"[eval] clean={args.clean}")
-        eprint(f"[eval] out={out_dir}")
+    profile_df = clean_df if args.profile_source == "clean" else dirty_df
+    is_num = infer_numeric_cols(profile_df, cols, numeric_success_threshold=float(args.numeric_success_threshold))
 
-    # 1) Load dirty/clean
-    dirty_df = read_csv_flexible(args.dirty)
-    clean_df = read_csv_flexible(args.clean)
+    # TRUTH
+    truth = compute_truth_cells(dirty_df, clean_df, cols, is_num)
 
-    # sanity row count
-    if len(dirty_df) != len(clean_df):
-        raise RuntimeError(f"Row count mismatch: dirty={len(dirty_df)} clean={len(clean_df)}")
+    # Build dirty parquet for dq_agent
+    dirty_run = dirty_df.copy()
+    dirty_run.insert(0, "row_id", range(1, nrows + 1))
+    data_parquet = out_dir / "dirty.parquet"
+    dirty_run.to_parquet(data_parquet, index=False)
 
-    # 2) Align columns (FIX)
-    dirty_aligned, clean_aligned, align_notes = align_dirty_clean(dirty_df, clean_df)
-
-    # 3) Normalize + truth
-    dirty_norm, clean_norm, numeric_cols = normalize_pair(dirty_aligned, clean_aligned)
-    truth_cells = compute_truth_error_cells(dirty_norm, clean_norm, numeric_cols)
-
-    # 4) Build config from profile source
-    profile_df = clean_norm if args.profile_source == "clean" else dirty_norm
-
-    params = ConfigGenParams(
-        max_allowed_values=int(args.max_allowed_values),
+    # Rules config
+    cfg, cfg_notes = build_rules_config(
+        dataset_name=args.dataset_name,
+        profile=profile_df,
+        cols=cols,
+        is_numeric=is_num,
+        nrows=nrows,
+        domain_cover=float(args.domain_cover),
+        max_domain=max_domain,
         z_outlier_mad=float(args.z_outlier_mad),
         null_slack=float(args.null_slack),
+        verbose=args.verbose,
     )
+    rules_path = out_dir / "rules.yml"
+    rules_path.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
-    cfg = build_dq_config(
-        profile_df=profile_df,
-        numeric_cols=numeric_cols,
-        dataset_name=args.dataset_name,
-        sample_rows=int(len(dirty_norm)),  # avoid sample truncation
-        params=params,
-    )
+    # Run dq_agent
+    dq_out = out_dir / "dq_out"
+    dq_out.mkdir(parents=True, exist_ok=True)
+    raw_log = out_dir / "dq_raw.log"
+    meta, dq_ec, wall, raw = run_dq_agent(data_parquet, rules_path, dq_out, args.fail_on, raw_log)
 
-    with open(rules_path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+    report_json_path = Path(meta["report_json_path"]).resolve()
+    run_record_path = Path(meta["run_record_path"]).resolve()
 
-    # 5) Run dq_agent on DIRTY
-    exit_code, wall_time_s, meta = run_dq_agent(
-        data_path=args.dirty,
-        config_path=rules_path,
-        dq_out_dir=dq_out_dir,
-        raw_log_path=raw_log_path,
-        fail_on=str(args.fail_on),
-    )
+    # dq_agent can exit 2 when fail-on triggers; that's expected.
+    # Exit 1 indicates unexpected failure.
+    if dq_ec not in (0, 2):
+        raise RuntimeError(f"dq_agent unexpected exit_code={dq_ec}. See {raw_log}")
 
-    report_json_path = meta.get("report_json_path")
-    run_record_path = meta.get("run_record_path")
+    report = json.loads(report_json_path.read_text(encoding="utf-8"))
+    pred, trunc = extract_predictions(report)
 
-    if not report_json_path or not os.path.exists(report_json_path):
-        raise RuntimeError(
-            "dq_agent did not produce a readable report.json\n"
-            f"exit_code={exit_code}\n"
-            f"report_json_path={report_json_path}\n"
-            f"raw_log_path={raw_log_path}"
-        )
+    # Compute metrics
+    # Filter to evaluation columns only (exclude synthetic row_id if it sneaks in)
+    pred = {(i, c) for (i, c) in pred if c in cols}
+    truth = {(i, c) for (i, c) in truth if c in cols}
 
-    report = json.load(open(report_json_path, "r", encoding="utf-8"))
+    tp = len(pred & truth)
+    fp = len(pred - truth)
+    fn = len(truth - pred)
 
-    # 6) Extract predictions
-    pred_cells, trunc_info = extract_predicted_cells_from_report(report)
+    c_prec, c_rec, c_f1 = f1_from_counts(tp, fp, fn)
 
-    # Keep only columns we evaluated truth on (aligned columns)
-    cols_set = set(dirty_norm.columns)
-    pred_cells = {(i, c) for (i, c) in pred_cells if c in cols_set and 0 <= i < len(dirty_norm)}
+    truth_rows = {i for (i, _) in truth}
+    pred_rows = {i for (i, _) in pred}
 
-    # 7) Metrics
-    tp = len(pred_cells & truth_cells)
-    fp = len(pred_cells - truth_cells)
-    fn = len(truth_cells - pred_cells)
+    rtp = len(truth_rows & pred_rows)
+    rfp = len(pred_rows - truth_rows)
+    rfn = len(truth_rows - pred_rows)
 
-    cell_m = compute_prf(tp, fp, fn)
+    r_prec, r_rec, r_f1 = f1_from_counts(rtp, rfp, rfn)
 
-    truth_rows = {i for (i, _) in truth_cells}
-    pred_rows = {i for (i, _) in pred_cells}
+    truth_err_cols = {c for (_, c) in truth}
+    pred_err_cols = {c for (_, c) in pred}
+    hit_cols = truth_err_cols & pred_err_cols
 
-    row_tp = len(truth_rows & pred_rows)
-    row_fp = len(pred_rows - truth_rows)
-    row_fn = len(truth_rows - pred_rows)
-    row_m = compute_prf(row_tp, row_fp, row_fn)
-
-    truth_cols = {c for (_, c) in truth_cells}
-    pred_cols = {c for (_, c) in pred_cells}
-
-    metrics: Dict[str, Any] = {
+    metrics_path = out_dir / "metrics.json"
+    metrics = {
         "dataset": {
             "name": args.dataset_name,
-            "rows": int(len(dirty_norm)),
-            "cols": int(len(dirty_norm.columns)),
+            "rows": nrows,
+            "cols": ncols,
             "profile_source": args.profile_source,
         },
         "dq_agent": {
-            "exit_code": int(exit_code),
-            "fail_on": str(args.fail_on),
-            "wall_time_s": float(wall_time_s),
-            "report_json_path": report_json_path,
-            "run_record_path": run_record_path,
-            "raw_log_path": raw_log_path,
-            "rules_path": rules_path,
+            "exit_code": dq_ec,
+            "fail_on": args.fail_on,
+            "wall_time_s": wall,
+            "report_json_path": str(report_json_path),
+            "run_record_path": str(run_record_path),
+            "raw_log_path": str(raw_log),
+            "rules_path": str(rules_path),
+            "data_parquet_path": str(data_parquet),
         },
         "truth": {
-            "error_cells": int(len(truth_cells)),
+            "error_cells": len(truth),
         },
         "pred": {
-            "predicted_cells": int(len(pred_cells)),
+            "predicted_cells": len(pred),
         },
-        "cell": cell_m,
-        "row": row_m,
+        "cell": {
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            "precision": c_prec,
+            "recall": c_rec,
+            "f1": c_f1,
+        },
+        "row": {
+            "tp": rtp,
+            "fp": rfp,
+            "fn": rfn,
+            "precision": r_prec,
+            "recall": r_rec,
+            "f1": r_f1,
+        },
         "column_coverage": {
-            "truth_error_columns": int(len(truth_cols)),
-            "predicted_error_columns": int(len(pred_cols)),
-            "hit_columns": int(len(truth_cols & pred_cols)),
+            "truth_error_columns": len(truth_err_cols),
+            "predicted_error_columns": len(pred_err_cols),
+            "hit_columns": len(hit_cols),
         },
-        "truncation": trunc_info,
+        "truncation": trunc,
         "notes": [
-            "Truth = dirty vs clean mismatch after normalization (strip, empty->NA, numeric coercion for numeric-like cols).",
-            "Pred = dq_agent FAIL rule_results/anomalies samples. Config sets report.sample_rows=nrows to avoid truncation.",
-            *align_notes,
-        ],
+            "Truth = dirty vs clean mismatch after normalization (strip, empty->NA, numeric coercion for numeric cols).",
+            "Pred = union of FAIL rule_results/anomalies samples from dq_agent report.json.",
+            f"Categorical domain uses coverage-based allowed_values (cover={float(args.domain_cover):.3f}, max_domain={max_domain}).",
+        ]
+        + cfg_notes,
     }
+    metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=False, indent=2)
-
-    # 8) Print ONE jsonl line summary to stdout (for bench scripts)
-    summary_line = {
+    summary = {
         "dataset": args.dataset_name,
-        "rows": int(len(dirty_norm)),
-        "cols": int(len(dirty_norm.columns)),
+        "rows": nrows,
+        "cols": ncols,
         "profile": args.profile_source,
-        "truth_err_cells": int(len(truth_cells)),
-        "predicted": int(len(pred_cells)),
-        "cell_f1": metrics["cell"].get("f1"),
-        "row_f1": metrics["row"].get("f1"),
-        "truncated": bool(trunc_info.get("truncated")),
-        "metrics_path": metrics_path,
+        "truth_err_cells": len(truth),
+        "predicted": len(pred),
+        "cell_f1": c_f1,
+        "row_f1": r_f1,
+        "truncated": bool(trunc.get("truncated")),
+        "metrics_path": str(metrics_path),
     }
-    print(json.dumps(summary_line, ensure_ascii=False))
-
-    if args.verbose:
-        eprint(f"[eval] wrote metrics: {metrics_path}")
-
+    print(json.dumps(summary, ensure_ascii=False))
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
