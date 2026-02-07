@@ -1,27 +1,18 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-Evaluate dq_agent on a (dirty.csv, clean.csv) pair (Raha-style).
+Evaluate dq_agent on a dirty/clean paired dataset (e.g., Raha):
+- Truth labels: cell-level mismatches between dirty vs clean after normalization.
+- Prediction: cells reported by dq_agent as FAIL (rule_results/anomalies) using full samples.
+- Outputs:
+  - metrics.json (detailed)
+  - prints one JSON line summary for bench scripts
 
-Truth:
-  cells where normalized(dirty) != normalized(clean)
-
-Pred:
-  cells that appear in dq_agent report FAIL rule_results/anomalies "samples"
-  (we rely on report.sample_rows being large enough to avoid truncation)
-
-Key improvement for dirty-profile:
-  coverage-based categorical domains:
-    allowed_values = most frequent values covering `--domain-cover` fraction,
-    up to `--max-domain` values.
-  If coverage is too low under max-domain (high-cardinality columns), we skip
-  allowed_values for that column to avoid flooding false positives.
-
-Outputs:
-  - <out>/rules.yml
-  - <out>/dirty.parquet
-  - <out>/dq_out/<run_id>/report.json (via dq_agent)
-  - <out>/metrics.json
-  - one-line JSON summary to stdout (for bench scripts)
+Key design:
+- Generate a dq_agent config from a "profile source" (clean or dirty).
+- For high-cardinality string columns, only emit allowed_values if top-K domain coverage >= threshold.
+  This prevents exploding false positives (e.g., tax.city).
 """
 
 from __future__ import annotations
@@ -29,309 +20,327 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
 import yaml
 
 
-Cell = Tuple[int, str]  # (row_index, column_name)
+# -----------------------------
+# Utils
+# -----------------------------
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
-def _eprint(*args: object) -> None:
-    print(*args, file=sys.stderr)
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
 
-def pick(d: Dict[str, Any], *keys: str) -> Any:
-    for k in keys:
-        if k in d:
-            return d[k]
-    return None
+def _strip_bom(s: str) -> str:
+    # handle UTF-8 BOM in some CSV headers
+    return s.lstrip("\ufeff")
 
 
-def read_csv(path: Path) -> pd.DataFrame:
-    # Keep strings as-is; avoid pandas turning empty into NaN automatically.
-    # We'll normalize ourselves.
-    df = pd.read_csv(path, dtype="string", keep_default_na=False)
-    # Drop common index columns accidentally saved.
-    drop_cols = [c for c in df.columns if str(c).startswith("Unnamed:")]
-    if drop_cols:
-        df = df.drop(columns=drop_cols)
-    return df
+def _norm_col_name(x: Any) -> str:
+    s = _strip_bom(str(x))
+    return s.strip()
 
 
 def normalize_string_series(s: pd.Series) -> pd.Series:
-    # s is string dtype
-    s2 = s.astype("string")
-    s2 = s2.str.strip()
-    # empty -> NA
-    s2 = s2.replace("", pd.NA)
-    return s2
-
-
-def normalize_numeric_series(s: pd.Series) -> pd.Series:
-    s2 = normalize_string_series(s)
-    # coercion
-    x = pd.to_numeric(s2, errors="coerce")
-    return x
-
-
-def equal_mask(a: pd.Series, b: pd.Series) -> pd.Series:
-    # True where equal; NA==NA treated as equal.
-    a_na = a.isna()
-    b_na = b.isna()
-    both_na = a_na & b_na
-    eq = (a == b)
-    # comparisons involving NA yield <NA>; treat as False
-    eq = eq.fillna(False)
-    return both_na | eq
-
-
-def align_columns(dirty: pd.DataFrame, clean: pd.DataFrame, verbose: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
-    dcols = list(dirty.columns)
-    ccols = list(clean.columns)
-    common = [c for c in dcols if c in clean.columns]
-
-    if common:
-        if verbose:
-            _eprint(f"[align] common columns={len(common)}")
-        dirty2 = dirty[common].copy()
-        clean2 = clean[common].copy()
-        return dirty2, clean2, common
-
-    # No common columns by name: try align by position if same width.
-    if dirty.shape[1] == clean.shape[1]:
-        if verbose:
-            _eprint("[align] no common names; aligning by position")
-            _eprint("[align] dirty cols:", dcols[:10], ("..." if len(dcols) > 10 else ""))
-            _eprint("[align] clean cols:", ccols[:10], ("..." if len(ccols) > 10 else ""))
-        clean2 = clean.copy()
-        clean2.columns = dcols
-        return dirty.copy(), clean2, dcols
-
-    raise RuntimeError(
-        "No common columns between dirty and clean, and column counts differ. "
-        f"dirty_cols={dirty.shape[1]} clean_cols={clean.shape[1]}"
-    )
-
-
-def infer_numeric_cols(
-    profile: pd.DataFrame,
-    cols: Sequence[str],
-    numeric_success_threshold: float,
-) -> Dict[str, bool]:
-    out: Dict[str, bool] = {}
-    for c in cols:
-        s = normalize_string_series(profile[c])
-        nonnull = s.dropna()
-        if nonnull.empty:
-            out[c] = False
-            continue
-        x = pd.to_numeric(nonnull, errors="coerce")
-        success = float(x.notna().mean())
-        out[c] = success >= numeric_success_threshold
-    return out
-
-
-@dataclass
-class DomainResult:
-    allowed: Optional[List[str]]
-    coverage: float
-    unique: int
-    used: bool
-    truncated: bool
-    reason: str
-
-
-def coverage_domain(
-    s: pd.Series,
-    cover: float,
-    max_domain: int,
-    min_usable_coverage: float = 0.50,
-) -> DomainResult:
-    s2 = normalize_string_series(s)
-    nonnull = s2.dropna()
-    if nonnull.empty:
-        return DomainResult(allowed=None, coverage=0.0, unique=0, used=False, truncated=False, reason="empty")
-
-    vc = nonnull.value_counts(dropna=True)
-    total = int(vc.sum())
-    unique = int(vc.shape[0])
-
-    # If column is extremely high-cardinality and top-k coverage is too low,
-    # allowed_values would create massive false positives => skip.
-    topk = vc.iloc[:max_domain]
-    topk_cov = float(topk.sum()) / float(total) if total > 0 else 0.0
-    if unique > max_domain and topk_cov < min_usable_coverage:
-        return DomainResult(
-            allowed=None,
-            coverage=topk_cov,
-            unique=unique,
-            used=False,
-            truncated=True,
-            reason=f"high_cardinality(top{max_domain}_coverage={topk_cov:.3f})",
-        )
-
-    allowed: List[str] = []
-    cum = 0
-    for val, cnt in vc.items():
-        allowed.append(str(val))
-        cum += int(cnt)
-        if total > 0 and (cum / total) >= cover:
-            break
-        if len(allowed) >= max_domain:
-            break
-
-    cov = float(cum) / float(total) if total > 0 else 0.0
-    truncated = (len(allowed) < unique) and (cov < cover)
-    used = True
-    reason = "ok"
-    if unique > max_domain and truncated:
-        reason = f"truncated_to_max_domain({max_domain})"
-    elif truncated:
-        reason = "truncated_before_cover"
-
-    return DomainResult(allowed=allowed, coverage=cov, unique=unique, used=used, truncated=truncated, reason=reason)
-
-
-def build_rules_config(
-    dataset_name: str,
-    profile: pd.DataFrame,
-    cols: Sequence[str],
-    is_numeric: Dict[str, bool],
-    nrows: int,
-    domain_cover: float,
-    max_domain: int,
-    z_outlier_mad: float,
-    null_slack: float,
-    verbose: bool = False,
-) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Returns: (config_dict, notes)
+    Normalize strings for both:
+      - truth comparison
+      - dq_agent input for string columns
+    Rules:
+      - strip whitespace
+      - empty -> NA
+      - common textual NA markers -> NA (conservative)
+    """
+    ss = s.astype("string")
+    ss = ss.str.strip()
+
+    # empty -> NA
+    ss = ss.replace("", pd.NA)
+
+    # conservative NA markers (optional; helps datasets with explicit NA tokens)
+    ss = ss.replace(
+        {
+            "NA": pd.NA,
+            "N/A": pd.NA,
+            "NULL": pd.NA,
+            "null": pd.NA,
+            "NaN": pd.NA,
+            "nan": pd.NA,
+        }
+    )
+    return ss
+
+
+def numeric_success_rate(s: pd.Series) -> float:
+    """
+    Fraction of non-null values that can be coerced to numeric.
+    """
+    ss = normalize_string_series(s)
+    non_null = int(ss.notna().sum())
+    if non_null == 0:
+        return 0.0
+    num = pd.to_numeric(ss, errors="coerce")
+    ok = int(num.notna().sum())
+    return ok / non_null
+
+
+def coerce_numeric(s: pd.Series) -> pd.Series:
+    """
+    Normalize then coerce to float (NaN if cannot parse).
+    """
+    ss = normalize_string_series(s)
+    return pd.to_numeric(ss, errors="coerce")
+
+
+def prf1(tp: int, fp: int, fn: int) -> Tuple[float, float, float]:
+    """
+    Define PR/F1 robustly:
+      - If tp=fp=fn=0 (empty truth and empty preds), treat as perfect => (1,1,1).
+      - If no preds but truth exists => precision=0, recall=0, f1=0.
+    """
+    if tp == 0 and fp == 0 and fn == 0:
+        return 1.0, 1.0, 1.0
+    prec = tp / (tp + fp) if (tp + fp) else 0.0
+    rec = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+    return prec, rec, f1
+
+
+def find_last_json_line(text: str) -> Dict[str, Any]:
+    """
+    dq_agent prints a single JSON object line; but to be robust we scan from bottom
+    for a line that parses as JSON dict.
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        if not (ln.startswith("{") and ln.endswith("}")):
+            continue
+        try:
+            obj = json.loads(ln)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+    raise RuntimeError("No JSON object found in dq_agent output")
+
+
+def drop_index_like_first_col(df: pd.DataFrame) -> Tuple[pd.DataFrame, bool]:
+    """
+    Drop an index-like first column if it looks like:
+      - name is Unnamed: 0 / index / idx / blank-ish
+      - values are monotonic increasing integers and mostly unique
+    """
+    if df.shape[1] == 0:
+        return df, False
+
+    first = df.columns[0]
+    name = str(first).strip().lower()
+
+    if not (name.startswith("unnamed") or name in ("index", "idx", "")):
+        return df, False
+
+    col = df.iloc[:, 0]
+    # try numeric
+    num = pd.to_numeric(normalize_string_series(col), errors="coerce")
+    if num.notna().mean() < 0.95:
+        return df, False
+
+    # unique-ish and monotonic-ish
+    nn = num.dropna()
+    if len(nn) < 10:
+        return df, False
+
+    # check near-unique
+    uniq_rate = nn.nunique(dropna=True) / len(nn)
+    if uniq_rate < 0.95:
+        return df, False
+
+    # monotonic increasing
+    if not nn.is_monotonic_increasing:
+        return df, False
+
+    # looks like index -> drop
+    return df.iloc[:, 1:].copy(), True
+
+
+def align_dirty_clean(
+    dirty: pd.DataFrame, clean: pd.DataFrame
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], List[str]]:
+    """
+    Align dirty and clean frames on a shared set of columns.
+    Returns:
+      dirty_aligned, clean_aligned, columns, notes
+    Strategy:
+      1) normalize column names (strip/BOM)
+      2) intersect on names
+      3) if empty, try dropping index-like first col then intersect again
+      4) if still empty, fall back to positional alignment on min(ncols)
     """
     notes: List[str] = []
 
-    cfg: Dict[str, Any] = {
-        "version": 1,
-        "dataset": {
-            "name": dataset_name,
-            "primary_key": ["row_id"],
-        },
-        "columns": {},
-        "report": {
-            # critical: to avoid truncation in report samples for metrics computation
-            "sample_rows": int(nrows),
-        },
-    }
+    dirty = dirty.copy()
+    clean = clean.copy()
+    dirty.columns = [_norm_col_name(c) for c in dirty.columns]
+    clean.columns = [_norm_col_name(c) for c in clean.columns]
 
-    # Always include row_id
-    cfg["columns"]["row_id"] = {
-        "type": "int",
-        "required": True,
-        "checks": [{"range": {"min": 1, "max": int(nrows)}}],
-    }
+    common = sorted(set(dirty.columns) & set(clean.columns))
+    if common:
+        return dirty[common].copy(), clean[common].copy(), common, notes
 
-    for c in cols:
-        # Evaluation columns exclude row_id; but config may include all.
-        col_cfg: Dict[str, Any] = {"required": True}
+    # try dropping index-like
+    dirty2, dropped_d = drop_index_like_first_col(dirty)
+    clean2, dropped_c = drop_index_like_first_col(clean)
+    if dropped_d or dropped_c:
+        notes.append(f"dropped index-like first column: dirty={dropped_d} clean={dropped_c}")
+        common2 = sorted(set(dirty2.columns) & set(clean2.columns))
+        if common2:
+            return dirty2[common2].copy(), clean2[common2].copy(), common2, notes
+        dirty, clean = dirty2, clean2  # continue with cleaned versions
 
-        if is_numeric.get(c, False):
-            # numeric
-            x = normalize_numeric_series(profile[c])
-            nonnull = x.dropna()
-            # If no numeric values, fallback to string
-            if nonnull.empty:
-                col_cfg["type"] = "string"
-                # minimal checks
-                col_cfg["checks"] = [{"not_null": {"max_null_rate": float(null_slack)}}]
-                col_cfg["anomalies"] = [{"missing_rate": {"max_rate": float(null_slack)}}]
-                cfg["columns"][c] = col_cfg
-                continue
+    # fallback: positional alignment
+    n = min(dirty.shape[1], clean.shape[1])
+    if n <= 0:
+        raise RuntimeError("No columns to align (both have 0 columns?)")
 
-            # Determine int vs float
-            vals = nonnull.to_numpy()
-            is_int = np.all(np.isfinite(vals) & (np.mod(vals, 1) == 0))
-            col_cfg["type"] = "int" if bool(is_int) else "float"
-
-            # Robust range: use extreme quantiles to reduce sensitivity to rare outliers.
-            lo = float(np.nanpercentile(vals, 0.1))
-            hi = float(np.nanpercentile(vals, 99.9))
-            if lo > hi:
-                lo, hi = hi, lo
-            span = hi - lo
-            if span == 0:
-                # constant column
-                lo2, hi2 = lo, hi
-            else:
-                lo2 = lo - 0.01 * span
-                hi2 = hi + 0.01 * span
-
-            col_cfg["checks"] = [
-                {"not_null": {"max_null_rate": float(null_slack)}},
-                {"range": {"min": lo2, "max": hi2}},
-            ]
-            col_cfg["anomalies"] = [
-                {"missing_rate": {"max_rate": float(null_slack)}},
-                {"outlier_mad": {"z": float(z_outlier_mad)}},
-            ]
-        else:
-            # categorical/string
-            col_cfg["type"] = "string"
-            checks: List[Dict[str, Any]] = [{"not_null": {"max_null_rate": float(null_slack)}}]
-            anomalies: List[Dict[str, Any]] = [{"missing_rate": {"max_rate": float(null_slack)}}]
-
-            dom = coverage_domain(profile[c], cover=domain_cover, max_domain=max_domain)
-            if verbose:
-                _eprint(f"[domain] {c}: used={dom.used} unique={dom.unique} coverage={dom.coverage:.3f} reason={dom.reason}")
-
-            if dom.used and dom.allowed:
-                checks.append({"allowed_values": {"values": dom.allowed}})
-                if dom.truncated:
-                    notes.append(f"domain_truncated:{c}:{dom.reason}:coverage={dom.coverage:.3f}:unique={dom.unique}")
-            else:
-                notes.append(f"domain_skipped:{c}:{dom.reason}:coverage={dom.coverage:.3f}:unique={dom.unique}")
-
-            col_cfg["checks"] = checks
-            col_cfg["anomalies"] = anomalies
-
-        cfg["columns"][c] = col_cfg
-
-    return cfg, notes
+    notes.append("no common columns by name; falling back to positional alignment")
+    new_cols = [f"col_{i}" for i in range(n)]
+    dirty_aligned = dirty.iloc[:, :n].copy()
+    clean_aligned = clean.iloc[:, :n].copy()
+    dirty_aligned.columns = new_cols
+    clean_aligned.columns = new_cols
+    return dirty_aligned, clean_aligned, new_cols, notes
 
 
-def extract_last_meta_json(raw_text: str) -> Dict[str, Any]:
+@dataclass
+class AllowedValuesDecision:
+    emitted: bool
+    mode: str                   # "all" | "topk" | "skip" | "empty"
+    nunique: int
+    non_null: int
+    top_k: int
+    coverage: float
+    values_count: int
+
+
+def decide_allowed_values(
+    s: pd.Series,
+    *,
+    max_allowed_values: int,
+    max_domain: int,
+    min_domain_coverage: float,
+) -> Tuple[Optional[List[str]], AllowedValuesDecision]:
     """
-    dq_agent prints a JSON line containing report_json_path/run_record_path.
-    We search from bottom for the last JSON object that contains these keys.
+    Decide whether to emit allowed_values for a string column.
+    - If nunique <= max_allowed_values => emit all unique values.
+    - Else consider top-K (K=max_domain) only if coverage >= min_domain_coverage.
+    - Otherwise skip (avoid high-cardinality/open-domain false positives).
     """
-    for line in reversed(raw_text.splitlines()):
-        s = line.strip()
-        if not s:
-            continue
-        if not (s.startswith("{") and s.endswith("}")):
-            continue
-        try:
-            obj = json.loads(s)
-        except Exception:
-            continue
-        if isinstance(obj, dict) and ("report_json_path" in obj) and ("run_record_path" in obj):
-            return obj
-    raise RuntimeError("No dq_agent meta JSON found in output.")
+    ss = normalize_string_series(s).dropna()
+    non_null = int(len(ss))
+    if non_null == 0:
+        return None, AllowedValuesDecision(
+            emitted=False, mode="empty", nunique=0, non_null=0, top_k=0, coverage=0.0, values_count=0
+        )
+
+    vc = ss.value_counts(dropna=True)
+    nunique = int(len(vc))
+
+    # small domain: full enumerate
+    if nunique <= max_allowed_values:
+        vals = vc.index.astype(str).tolist()
+        return vals, AllowedValuesDecision(
+            emitted=True,
+            mode="all",
+            nunique=nunique,
+            non_null=non_null,
+            top_k=nunique,
+            coverage=1.0,
+            values_count=len(vals),
+        )
+
+    # large domain: maybe top-K if coverage is high
+    if max_domain <= 0:
+        return None, AllowedValuesDecision(
+            emitted=False, mode="skip", nunique=nunique, non_null=non_null, top_k=0, coverage=0.0, values_count=0
+        )
+
+    k = min(int(max_domain), nunique)
+    top = vc.head(k)
+    cov = float(top.sum()) / float(non_null) if non_null else 0.0
+
+    if cov < float(min_domain_coverage):
+        return None, AllowedValuesDecision(
+            emitted=False,
+            mode="skip",
+            nunique=nunique,
+            non_null=non_null,
+            top_k=k,
+            coverage=cov,
+            values_count=0,
+        )
+
+    vals = top.index.astype(str).tolist()
+    return vals, AllowedValuesDecision(
+        emitted=True,
+        mode="topk",
+        nunique=nunique,
+        non_null=non_null,
+        top_k=k,
+        coverage=cov,
+        values_count=len(vals),
+    )
+
+
+def write_yaml(path: Path, obj: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(obj, f, sort_keys=False, allow_unicode=True)
+
+
+def try_write_parquet_else_csv(df: pd.DataFrame, out_base: Path) -> Tuple[Path, str]:
+    """
+    Prefer Parquet for stable dtypes; fallback to CSV if parquet engine missing.
+    """
+    pq = out_base.with_suffix(".parquet")
+    try:
+        df.to_parquet(pq, index=False)
+        return pq, "parquet"
+    except Exception:
+        csv = out_base.with_suffix(".csv")
+        # keep empty as empty
+        df.to_csv(csv, index=False)
+        return csv, "csv"
 
 
 def run_dq_agent(
+    *,
     data_path: Path,
     config_path: Path,
-    out_dir: Path,
+    dq_out_dir: Path,
     fail_on: str,
     raw_log_path: Path,
-) -> Tuple[Dict[str, Any], int, float, str]:
+    verbose: bool,
+) -> Tuple[int, Dict[str, Any], float]:
+    """
+    Run `python -m dq_agent run ...` and return:
+      exit_code, meta_json, wall_time_s
+    """
+    _ensure_dir(dq_out_dir)
+    _ensure_dir(raw_log_path.parent)
+
     cmd = [
         sys.executable,
         "-m",
@@ -342,323 +351,497 @@ def run_dq_agent(
         "--config",
         str(config_path),
         "--output-dir",
-        str(out_dir),
+        str(dq_out_dir),
         "--fail-on",
-        fail_on,
+        str(fail_on),
     ]
+
     t0 = time.time()
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    t1 = time.time()
-    raw = proc.stdout
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    wall = time.time() - t0
+
+    raw = proc.stdout or ""
     raw_log_path.write_text(raw, encoding="utf-8")
-    meta = extract_last_meta_json(raw)
-    return meta, int(proc.returncode), float(t1 - t0), raw
+
+    if verbose:
+        sys.stderr.write(raw)
+        sys.stderr.flush()
+
+    meta = find_last_json_line(raw)
+    return proc.returncode, meta, wall
 
 
-def extract_predictions(report: Dict[str, Any]) -> Tuple[Set[Cell], Dict[str, Any]]:
-    pred: Set[Cell] = set()
+def extract_predicted_cells_from_report(report: Dict[str, Any]) -> Tuple[Set[Tuple[int, str]], Dict[str, Any]]:
+    """
+    Build predicted error cell set from dq_agent report:
+      - rule_results with status FAIL: each sample row_index => (row_index, column)
+      - anomalies with status FAIL: each sample row_index => (row_index, column)
+    Also returns truncation info.
+    """
+    pred: Set[Tuple[int, str]] = set()
     trunc_details: List[Dict[str, Any]] = []
 
     # rule_results
-    rr = report.get("rule_results") or []
-    for r in rr:
-        if not isinstance(r, dict):
-            continue
+    for r in (report.get("rule_results") or []):
         status = r.get("status")
-        passed = r.get("passed")
-        is_fail = (status == "FAIL") or (passed is False)
-        if not is_fail:
+        if status != "FAIL" and r.get("passed") is not False:
             continue
 
-        col = pick(r, "column", "col")
+        col = r.get("column")
         if not col:
             continue
 
         samples = r.get("samples") or []
-        for s in samples:
-            if not isinstance(s, dict):
-                continue
-            idx = pick(s, "row_index", "row", "index")
-            if idx is None:
-                continue
-            pred.add((int(idx), str(col)))
-
         failed_count = r.get("failed_count")
-        if failed_count is not None and isinstance(failed_count, (int, float)):
-            if len(samples) < int(failed_count):
-                trunc_details.append(
-                    {
-                        "kind": "rule_result",
-                        "rule_id": r.get("rule_id"),
-                        "column": str(col),
-                        "failed_count": int(failed_count),
-                        "samples": len(samples),
-                    }
-                )
+        # detect truncation
+        if isinstance(failed_count, int) and failed_count > len(samples):
+            trunc_details.append(
+                {
+                    "kind": "rule_result",
+                    "rule_id": r.get("rule_id"),
+                    "column": col,
+                    "failed_count": failed_count,
+                    "sample_count": len(samples),
+                }
+            )
+
+        for s in samples:
+            ri = s.get("row_index")
+            if ri is None:
+                continue
+            try:
+                i = int(ri)
+            except Exception:
+                continue
+            pred.add((i, str(col)))
 
     # anomalies
-    an = report.get("anomalies") or []
-    for a in an:
-        if not isinstance(a, dict):
-            continue
+    for a in (report.get("anomalies") or []):
         status = a.get("status")
         if status != "FAIL":
             continue
-        col = pick(a, "column", "col")
+
+        col = a.get("column")
         if not col:
             continue
 
         samples = a.get("samples") or []
+        # anomalies don't always have failed_count; still track if suspicious
+        # (keep it simple: if FAIL but zero samples, mark as potentially truncated)
+        if len(samples) == 0:
+            trunc_details.append(
+                {
+                    "kind": "anomaly",
+                    "anomaly_id": a.get("anomaly_id"),
+                    "column": str(col),
+                    "note": "FAIL anomaly with 0 samples (may be truncated or summary-only detector).",
+                }
+            )
+
         for s in samples:
-            if not isinstance(s, dict):
+            ri = s.get("row_index")
+            if ri is None:
                 continue
-            idx = pick(s, "row_index", "row", "index")
-            if idx is None:
+            try:
+                i = int(ri)
+            except Exception:
                 continue
-            pred.add((int(idx), str(col)))
+            pred.add((i, str(col)))
 
-        metric = a.get("metric") or {}
-        # best-effort truncation detection
-        for k in ("null_count", "outlier_count", "n_outliers", "num_outliers", "count_outliers"):
-            if k in metric and isinstance(metric[k], (int, float)):
-                if len(samples) < int(metric[k]):
-                    trunc_details.append(
-                        {
-                            "kind": "anomaly",
-                            "anomaly_id": a.get("anomaly_id"),
-                            "column": str(col),
-                            "metric_count_key": k,
-                            "metric_count": int(metric[k]),
-                            "samples": len(samples),
-                        }
-                    )
-                break
-
-    trunc = {"truncated": bool(trunc_details), "details": trunc_details}
+    trunc = {"truncated": len(trunc_details) > 0, "details": trunc_details}
     return pred, trunc
 
 
 def compute_truth_cells(
     dirty: pd.DataFrame,
     clean: pd.DataFrame,
-    cols: Sequence[str],
-    is_numeric: Dict[str, bool],
-) -> Set[Cell]:
-    if len(dirty) != len(clean):
-        raise RuntimeError(f"Row count mismatch: dirty={len(dirty)} clean={len(clean)}")
+    cols: List[str],
+    numeric_cols: Set[str],
+) -> Set[Tuple[int, str]]:
+    """
+    Truth = dirty vs clean mismatch after normalization.
+    For numeric cols: numeric coercion + isclose (tolerance).
+    For string cols: strip + NA normalization + string compare.
+    """
+    if dirty.shape[0] != clean.shape[0]:
+        raise RuntimeError(f"Row count mismatch: dirty={dirty.shape[0]} clean={clean.shape[0]}")
 
-    truth: Set[Cell] = set()
+    truth: Set[Tuple[int, str]] = set()
+    n = dirty.shape[0]
+
     for c in cols:
-        if is_numeric.get(c, False):
-            a = normalize_numeric_series(dirty[c])
-            b = normalize_numeric_series(clean[c])
+        if c in numeric_cols:
+            dnum = coerce_numeric(dirty[c])
+            cnum = coerce_numeric(clean[c])
+            # both NaN -> equal
+            both_na = dnum.isna() & cnum.isna()
+            one_na = dnum.isna() ^ cnum.isna()
+            # both numeric: compare isclose
+            # note: if both notna, isclose works; if any NaN, handled above
+            close = np.isclose(dnum.fillna(0.0).to_numpy(), cnum.fillna(0.0).to_numpy(), atol=1e-9, rtol=0.0)
+            eq = both_na.to_numpy() | (~one_na.to_numpy() & close)
+            mismatch_idx = np.flatnonzero(~eq)
         else:
-            a = normalize_string_series(dirty[c])
-            b = normalize_string_series(clean[c])
+            ds = normalize_string_series(dirty[c])
+            cs = normalize_string_series(clean[c])
+            both_na = ds.isna() & cs.isna()
+            eq = (ds == cs) | both_na
+            mismatch_idx = np.flatnonzero(~eq.fillna(False).to_numpy())
 
-        eq = equal_mask(a, b)
-        mismatch = (~eq).to_numpy()
-        idxs = np.flatnonzero(mismatch)
-        for i in idxs:
-            truth.add((int(i), str(c)))
+        for i in mismatch_idx:
+            truth.add((int(i), c))
 
     return truth
 
 
-def f1_from_counts(tp: int, fp: int, fn: int) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    # returns (precision, recall, f1), with None where undefined (no truth)
-    tp = int(tp); fp = int(fp); fn = int(fn)
-    pred_pos = tp + fp
-    truth_pos = tp + fn
+def infer_numeric_cols(
+    profile_df: pd.DataFrame,
+    cols: List[str],
+    numeric_success_threshold: float,
+) -> Set[str]:
+    numeric_cols: Set[str] = set()
+    for c in cols:
+        rate = numeric_success_rate(profile_df[c])
+        if rate >= float(numeric_success_threshold):
+            numeric_cols.add(c)
+    return numeric_cols
 
-    if truth_pos == 0:
-        # no positives in truth: recall undefined
-        precision = 1.0 if pred_pos == 0 else 0.0
-        recall = None
-        f1 = None if pred_pos == 0 else 0.0
-        return precision, recall, f1
 
-    precision = tp / pred_pos if pred_pos > 0 else 0.0
-    recall = tp / truth_pos if truth_pos > 0 else 0.0
-    if (precision + recall) == 0:
-        return precision, recall, 0.0
-    return precision, recall, (2 * precision * recall / (precision + recall))
+# -----------------------------
+# Main
+# -----------------------------
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Evaluate dq_agent on dirty/clean datasets with cell-level truth labels.")
+
+    p.add_argument("--dirty", required=True, help="Path to dirty.csv")
+    p.add_argument("--clean", required=True, help="Path to clean.csv")
+    p.add_argument("--out", required=True, help="Output directory for this dataset eval")
+    p.add_argument("--dataset-name", required=True, help="Dataset name for reports (e.g., raha/tax)")
+
+    # accept both hyphen and underscore variants
+    p.add_argument(
+        "--profile-source", "--profile_source",
+        dest="profile_source",
+        choices=["clean", "dirty"],
+        default="clean",
+        help="Build profiling rules from clean or dirty dataset."
+    )
+    p.add_argument(
+        "--fail-on", "--fail_on",
+        dest="fail_on",
+        default="INFO",
+        help="Pass through to dq_agent --fail-on (info|warn|error).",
+    )
+
+    # rule generation knobs
+    p.add_argument(
+        "--max-allowed-values", "--max_allowed_values",
+        dest="max_allowed_values",
+        type=int,
+        default=200,
+        help="Emit allowed_values for string columns only if nunique <= this."
+    )
+    p.add_argument(
+        "--max-domain", "--max_domain",
+        dest="max_domain",
+        type=int,
+        default=2000,
+        help="If nunique > max_allowed_values, consider top-K domain of this size for allowed_values."
+    )
+    p.add_argument(
+        "--min-domain-coverage", "--min_domain_coverage",
+        dest="min_domain_coverage",
+        type=float,
+        default=0.98,
+        help="Only emit allowed_values (top-K) if top-K covers >= this fraction of non-null rows."
+    )
+    p.add_argument(
+        "--numeric-success-threshold", "--numeric_success_threshold",
+        dest="numeric_success_threshold",
+        type=float,
+        default=0.98,
+        help="Infer a column as numeric if >= this fraction of non-null values parse as numeric."
+    )
+    p.add_argument(
+        "--z-outlier-mad", "--z_outlier_mad",
+        dest="z_outlier_mad",
+        type=float,
+        default=6.0,
+        help="MAD z-score threshold for outlier_mad anomaly detector."
+    )
+    p.add_argument(
+        "--null-slack", "--null_slack",
+        dest="null_slack",
+        type=float,
+        default=0.01,
+        help="Slack added to profile null rate to set max_null_rate / max_rate thresholds."
+    )
+
+    p.add_argument("--verbose", action="store_true", help="Print dq_agent raw output to stderr.")
+    return p
 
 
 def main() -> int:
-    p = argparse.ArgumentParser()
-    p.add_argument("--dirty", required=True, help="Path to dirty.csv")
-    p.add_argument("--clean", required=True, help="Path to clean.csv")
-    p.add_argument("--out", required=True, help="Output directory for this dataset evaluation")
-    p.add_argument("--dataset-name", "--dataset_name", required=True, dest="dataset_name")
+    args = build_arg_parser().parse_args()
 
-    p.add_argument("--profile-source", "--profile_source", dest="profile_source", choices=["clean", "dirty"], default="clean")
-    p.add_argument("--fail-on", "--fail_on", dest="fail_on", choices=["INFO", "WARN", "ERROR"], default="INFO")
+    dirty_path = Path(args.dirty).expanduser().resolve()
+    clean_path = Path(args.clean).expanduser().resolve()
+    out_dir = Path(args.out).expanduser().resolve()
+    dataset_name = str(args.dataset_name)
 
-    p.add_argument("--domain-cover", "--domain_cover", dest="domain_cover", type=float, default=0.99)
-    p.add_argument("--max-domain", "--max_domain", dest="max_domain", type=int, default=2000)
-    p.add_argument("--max-allowed-values", "--max_allowed_values", dest="max_allowed_values", type=int, default=None)
+    _ensure_dir(out_dir)
 
-    p.add_argument("--numeric-success-threshold", "--numeric_success_threshold",
-                   dest="numeric_success_threshold", type=float, default=0.98)
-    p.add_argument("--z-outlier-mad", "--z_outlier_mad", dest="z_outlier_mad", type=float, default=6.0)
-    p.add_argument("--null-slack", "--null_slack", dest="null_slack", type=float, default=0.02)
+    # Read as strings (we normalize ourselves)
+    dirty_df = pd.read_csv(dirty_path, dtype=str, keep_default_na=False, na_filter=False)
+    clean_df = pd.read_csv(clean_path, dtype=str, keep_default_na=False, na_filter=False)
 
-    p.add_argument("--verbose", action="store_true")
+    dirty_aligned, clean_aligned, cols, align_notes = align_dirty_clean(dirty_df, clean_df)
 
-    args = p.parse_args()
+    # profile source for type inference + rule generation
+    profile_df = clean_aligned if args.profile_source == "clean" else dirty_aligned
 
-    dirty_path = Path(args.dirty).resolve()
-    clean_path = Path(args.clean).resolve()
-    out_dir = Path(args.out).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    numeric_cols = infer_numeric_cols(profile_df, cols, args.numeric_success_threshold)
 
-    # effective max_domain
-    max_domain = int(args.max_domain)
-    if args.max_allowed_values is not None:
-        max_domain = min(max_domain, int(args.max_allowed_values))
+    # compute truth labels
+    truth_cells = compute_truth_cells(dirty_aligned, clean_aligned, cols, numeric_cols)
+    truth_rows = {r for (r, _) in truth_cells}
 
-    dirty_df = read_csv(dirty_path)
-    clean_df = read_csv(clean_path)
-    dirty_df, clean_df, cols = align_columns(dirty_df, clean_df, verbose=args.verbose)
+    # prepare dq_agent input DF (dirty)
+    run_df = pd.DataFrame(index=dirty_aligned.index)
 
-    nrows = int(len(dirty_df))
-    ncols = int(len(cols))
+    # keep same columns order as cols
+    for c in cols:
+        if c in numeric_cols:
+            run_df[c] = coerce_numeric(dirty_aligned[c]).astype("float64")
+        else:
+            run_df[c] = normalize_string_series(dirty_aligned[c])
 
-    profile_df = clean_df if args.profile_source == "clean" else dirty_df
-    is_num = infer_numeric_cols(profile_df, cols, numeric_success_threshold=float(args.numeric_success_threshold))
+    # row_id for dq_agent primary key
+    run_df.insert(0, "row_id", np.arange(1, len(run_df) + 1, dtype=np.int64))
 
-    # TRUTH
-    truth = compute_truth_cells(dirty_df, clean_df, cols, is_num)
+    # write dq_agent input
+    data_base = out_dir / "dq_data"
+    data_path, data_fmt = try_write_parquet_else_csv(run_df, data_base)
 
-    # Build dirty parquet for dq_agent
-    dirty_run = dirty_df.copy()
-    dirty_run.insert(0, "row_id", range(1, nrows + 1))
-    data_parquet = out_dir / "dirty.parquet"
-    dirty_run.to_parquet(data_parquet, index=False)
+    # generate dq_agent config
+    # thresholds derived from profile dataset (clean/dirty)
+    gen_cfg_summary: Dict[str, Any] = {}
 
-    # Rules config
-    cfg, cfg_notes = build_rules_config(
-        dataset_name=args.dataset_name,
-        profile=profile_df,
-        cols=cols,
-        is_numeric=is_num,
-        nrows=nrows,
-        domain_cover=float(args.domain_cover),
-        max_domain=max_domain,
-        z_outlier_mad=float(args.z_outlier_mad),
-        null_slack=float(args.null_slack),
-        verbose=args.verbose,
+    columns_cfg: Dict[str, Any] = {
+        "row_id": {
+            "type": "int",
+            "required": True,
+            "checks": [{"unique": True}],
+        }
+    }
+
+    # report.sample_rows = nrows to avoid truncation (needed for cell-level evaluation)
+    nrows = int(run_df.shape[0])
+
+    for c in cols:
+        col_cfg: Dict[str, Any] = {
+            "required": False,
+            "checks": [],
+        }
+
+        if c in numeric_cols:
+            col_cfg["type"] = "float"
+
+            prof_num = coerce_numeric(profile_df[c])
+            prof_null_rate = float(prof_num.isna().mean())
+            max_null_rate = min(1.0, max(0.0, prof_null_rate + float(args.null_slack)))
+
+            # not_null threshold
+            col_cfg["checks"].append({"not_null": {"max_null_rate": max_null_rate}})
+
+            # range from profile min/max (if any)
+            nn = prof_num.dropna()
+            if len(nn) > 0:
+                mn = float(nn.min())
+                mx = float(nn.max())
+                col_cfg["checks"].append({"range": {"min": mn, "max": mx}})
+                col_cfg["anomalies"] = [{"outlier_mad": {"z": float(args.z_outlier_mad)}}]
+            else:
+                col_cfg["anomalies"] = []
+
+            gen_cfg_summary[c] = {
+                "kind": "numeric",
+                "numeric_success_rate": numeric_success_rate(profile_df[c]),
+                "profile_null_rate": prof_null_rate,
+                "max_null_rate": max_null_rate,
+            }
+
+        else:
+            col_cfg["type"] = "string"
+
+            prof_str = normalize_string_series(profile_df[c])
+            prof_null_rate = float(prof_str.isna().mean())
+            max_null_rate = min(1.0, max(0.0, prof_null_rate + float(args.null_slack)))
+
+            col_cfg["checks"].append({"not_null": {"max_null_rate": max_null_rate}})
+
+            allowed, decision = decide_allowed_values(
+                profile_df[c],
+                max_allowed_values=int(args.max_allowed_values),
+                max_domain=int(args.max_domain),
+                min_domain_coverage=float(args.min_domain_coverage),
+            )
+
+            if allowed:
+                col_cfg["checks"].append({"allowed_values": {"values": allowed}})
+
+            # missing_rate anomaly mirrors null threshold (kept for detector coverage)
+            col_cfg["anomalies"] = [{"missing_rate": {"max_rate": max_null_rate}}]
+
+            gen_cfg_summary[c] = {
+                "kind": "string",
+                "profile_null_rate": prof_null_rate,
+                "max_null_rate": max_null_rate,
+                "allowed_values": decision.__dict__,
+            }
+
+        columns_cfg[c] = col_cfg
+
+    config_obj: Dict[str, Any] = {
+        "version": 1,
+        "dataset": {
+            "name": dataset_name,
+            "primary_key": ["row_id"],
+        },
+        "columns": columns_cfg,
+        "report": {
+            "sample_rows": nrows,
+        },
+    }
+
+    config_path = out_dir / "dq_config.yml"
+    write_yaml(config_path, config_obj)
+
+    # run dq_agent
+    dq_out_dir = out_dir / "dq_out"
+    raw_log_path = out_dir / "dq_raw.log"
+
+    exit_code, meta, wall = run_dq_agent(
+        data_path=data_path,
+        config_path=config_path,
+        dq_out_dir=dq_out_dir,
+        fail_on=str(args.fail_on),
+        raw_log_path=raw_log_path,
+        verbose=bool(args.verbose),
     )
-    rules_path = out_dir / "rules.yml"
-    rules_path.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
-    # Run dq_agent
-    dq_out = out_dir / "dq_out"
-    dq_out.mkdir(parents=True, exist_ok=True)
-    raw_log = out_dir / "dq_raw.log"
-    meta, dq_ec, wall, raw = run_dq_agent(data_parquet, rules_path, dq_out, args.fail_on, raw_log)
-
-    report_json_path = Path(meta["report_json_path"]).resolve()
-    run_record_path = Path(meta["run_record_path"]).resolve()
-
-    # dq_agent can exit 2 when fail-on triggers; that's expected.
-    # Exit 1 indicates unexpected failure.
-    if dq_ec not in (0, 2):
-        raise RuntimeError(f"dq_agent unexpected exit_code={dq_ec}. See {raw_log}")
+    report_json_path = Path(meta["report_json_path"]).expanduser().resolve()
+    run_record_path = Path(meta["run_record_path"]).expanduser().resolve()
 
     report = json.loads(report_json_path.read_text(encoding="utf-8"))
-    pred, trunc = extract_predictions(report)
 
-    # Compute metrics
-    # Filter to evaluation columns only (exclude synthetic row_id if it sneaks in)
-    pred = {(i, c) for (i, c) in pred if c in cols}
-    truth = {(i, c) for (i, c) in truth if c in cols}
+    # predicted cells
+    pred_cells, trunc = extract_predicted_cells_from_report(report)
+    pred_rows = {r for (r, _) in pred_cells}
 
-    tp = len(pred & truth)
-    fp = len(pred - truth)
-    fn = len(truth - pred)
+    # confusion
+    tp = len(pred_cells & truth_cells)
+    fp = len(pred_cells - truth_cells)
+    fn = len(truth_cells - pred_cells)
+    cprec, crec, cf1 = prf1(tp, fp, fn)
 
-    c_prec, c_rec, c_f1 = f1_from_counts(tp, fp, fn)
-
-    truth_rows = {i for (i, _) in truth}
-    pred_rows = {i for (i, _) in pred}
-
-    rtp = len(truth_rows & pred_rows)
+    rtp = len(pred_rows & truth_rows)
     rfp = len(pred_rows - truth_rows)
     rfn = len(truth_rows - pred_rows)
+    rprec, rrec, rf1 = prf1(rtp, rfp, rfn)
 
-    r_prec, r_rec, r_f1 = f1_from_counts(rtp, rfp, rfn)
+    # column coverage
+    truth_cols = {c for (_, c) in truth_cells}
+    pred_cols = {c for (_, c) in pred_cells}
+    cov = {
+        "truth_error_columns": len(truth_cols),
+        "predicted_error_columns": len(pred_cols),
+        "hit_columns": len(truth_cols & pred_cols),
+    }
 
-    truth_err_cols = {c for (_, c) in truth}
-    pred_err_cols = {c for (_, c) in pred}
-    hit_cols = truth_err_cols & pred_err_cols
-
-    metrics_path = out_dir / "metrics.json"
+    # metrics.json
     metrics = {
         "dataset": {
-            "name": args.dataset_name,
-            "rows": nrows,
-            "cols": ncols,
+            "name": dataset_name,
+            "rows": int(len(run_df)),
+            "cols": int(len(cols)),
             "profile_source": args.profile_source,
+            "aligned_columns": cols,
+            "numeric_columns": sorted(list(numeric_cols)),
+            "alignment_notes": align_notes,
+        },
+        "generated_config": {
+            "path": str(config_path),
+            "data_path": str(data_path),
+            "data_format": data_fmt,
+            "sample_rows": nrows,
+            "max_allowed_values": int(args.max_allowed_values),
+            "max_domain": int(args.max_domain),
+            "min_domain_coverage": float(args.min_domain_coverage),
+            "numeric_success_threshold": float(args.numeric_success_threshold),
+            "null_slack": float(args.null_slack),
+            "z_outlier_mad": float(args.z_outlier_mad),
+            "per_column_summary": gen_cfg_summary,
         },
         "dq_agent": {
-            "exit_code": dq_ec,
-            "fail_on": args.fail_on,
-            "wall_time_s": wall,
+            "exit_code": int(exit_code),
+            "fail_on": str(args.fail_on),
+            "wall_time_s": float(wall),
             "report_json_path": str(report_json_path),
             "run_record_path": str(run_record_path),
-            "raw_log_path": str(raw_log),
-            "rules_path": str(rules_path),
-            "data_parquet_path": str(data_parquet),
+            "raw_log_path": str(raw_log_path),
         },
-        "truth": {
-            "error_cells": len(truth),
-        },
-        "pred": {
-            "predicted_cells": len(pred),
-        },
+        "truth": {"error_cells": int(len(truth_cells))},
+        "pred": {"predicted_cells": int(len(pred_cells))},
         "cell": {
-            "tp": tp,
-            "fp": fp,
-            "fn": fn,
-            "precision": c_prec,
-            "recall": c_rec,
-            "f1": c_f1,
+            "tp": int(tp),
+            "fp": int(fp),
+            "fn": int(fn),
+            "precision": float(cprec),
+            "recall": float(crec),
+            "f1": float(cf1),
         },
         "row": {
-            "tp": rtp,
-            "fp": rfp,
-            "fn": rfn,
-            "precision": r_prec,
-            "recall": r_rec,
-            "f1": r_f1,
+            "tp": int(rtp),
+            "fp": int(rfp),
+            "fn": int(rfn),
+            "precision": float(rprec),
+            "recall": float(rrec),
+            "f1": float(rf1),
         },
-        "column_coverage": {
-            "truth_error_columns": len(truth_err_cols),
-            "predicted_error_columns": len(pred_err_cols),
-            "hit_columns": len(hit_cols),
-        },
+        "column_coverage": cov,
         "truncation": trunc,
         "notes": [
             "Truth = dirty vs clean mismatch after normalization (strip, empty->NA, numeric coercion for numeric cols).",
-            "Pred = union of FAIL rule_results/anomalies samples from dq_agent report.json.",
-            f"Categorical domain uses coverage-based allowed_values (cover={float(args.domain_cover):.3f}, max_domain={max_domain}).",
-        ]
-        + cfg_notes,
+            "Pred = dq_agent FAIL rule_results/anomalies samples. Config sets report.sample_rows=nrows to avoid truncation.",
+        ],
+        "meta": {
+            "generated_at": _now_iso(),
+            "script": "scripts/eval_dirty_clean.py",
+            "python": sys.version.split()[0],
+        },
     }
+
+    metrics_path = out_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # bench-friendly single-line summary
     summary = {
-        "dataset": args.dataset_name,
-        "rows": nrows,
-        "cols": ncols,
+        "dataset": dataset_name,
+        "rows": int(len(run_df)),
+        "cols": int(len(cols)),
         "profile": args.profile_source,
-        "truth_err_cells": len(truth),
-        "predicted": len(pred),
-        "cell_f1": c_f1,
-        "row_f1": r_f1,
-        "truncated": bool(trunc.get("truncated")),
+        "truth_err_cells": int(len(truth_cells)),
+        "predicted": int(len(pred_cells)),
+        "cell_f1": float(cf1),
+        "row_f1": float(rf1),
+        "truncated": bool(trunc.get("truncated", False)),
         "metrics_path": str(metrics_path),
     }
     print(json.dumps(summary, ensure_ascii=False))
@@ -667,3 +850,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
