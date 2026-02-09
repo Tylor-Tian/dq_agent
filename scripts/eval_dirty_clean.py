@@ -583,6 +583,56 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Slack added to profile null rate to set max_null_rate / max_rate thresholds."
     )
 
+    # string-noise detector knobs (for open-domain string columns)
+    p.add_argument(
+        "--string-noise", "--string_noise",
+        dest="string_noise",
+        action="store_true",
+        default=True,
+        help="Enable string_noise check for string columns (default: enabled).",
+    )
+    p.add_argument(
+        "--no-string-noise", "--no_string_noise",
+        dest="string_noise",
+        action="store_false",
+        help="Disable string_noise check.",
+    )
+    p.add_argument(
+        "--string-noise-scope", "--string_noise_scope",
+        dest="string_noise_scope",
+        choices=["open_domain", "all"],
+        default="open_domain",
+        help="Where to apply string_noise: open_domain (no allowed_values) or all string columns.",
+    )
+    p.add_argument(
+        "--string-noise-contains", "--string_noise_contains",
+        dest="string_noise_contains",
+        action="append",
+        default=None,
+        help="Literal substring to flag as noise. Repeatable. Default: '*' and \"''\".",
+    )
+    p.add_argument(
+        "--string-noise-regex", "--string_noise_regex",
+        dest="string_noise_regex",
+        action="append",
+        default=None,
+        help="Regex pattern to flag as noise. Repeatable. Default: none.",
+    )
+    p.add_argument(
+        "--string-noise-ignore-case", "--string_noise_ignore_case",
+        dest="string_noise_ignore_case",
+        action="store_true",
+        default=False,
+        help="Case-insensitive string noise matching.",
+    )
+    p.add_argument(
+        "--string-noise-max-rate", "--string_noise_max_rate",
+        dest="string_noise_max_rate",
+        type=float,
+        default=0.0,
+        help="Tolerated noisy fraction (failed_count/rows). Default 0.0 => any match fails.",
+    )
+
     p.add_argument("--verbose", action="store_true", help="Print dq_agent raw output to stderr.")
     return p
 
@@ -607,6 +657,19 @@ def main() -> int:
     profile_df = clean_aligned if args.profile_source == "clean" else dirty_aligned
 
     numeric_cols = infer_numeric_cols(profile_df, cols, args.numeric_success_threshold)
+
+    # string_noise default patterns (aligned with scripts/bench_raha_noise_union.sh)
+    default_noise_contains = ["*", "''"]
+    string_noise_contains = (
+        args.string_noise_contains if args.string_noise_contains is not None else default_noise_contains
+    )
+    string_noise_regex = args.string_noise_regex if args.string_noise_regex is not None else []
+    string_noise_params: Dict[str, Any] = {
+        "contains": string_noise_contains,
+        "regex": string_noise_regex,
+        "ignore_case": bool(args.string_noise_ignore_case),
+        "max_rate": float(args.string_noise_max_rate),
+    }
 
     # compute truth labels
     truth_cells = compute_truth_cells(dirty_aligned, clean_aligned, cols, numeric_cols)
@@ -693,6 +756,14 @@ def main() -> int:
                 min_domain_coverage=float(args.min_domain_coverage),
             )
 
+            # Heuristic string noise detector: primarily for open-domain columns where allowed_values is skipped.
+            if bool(args.string_noise) and (string_noise_contains or string_noise_regex):
+                should_apply = (
+                    str(args.string_noise_scope) == "all" or (not decision.emitted and decision.mode == "skip")
+                )
+                if should_apply:
+                    col_cfg["checks"].append({"string_noise": dict(string_noise_params)})
+
             if allowed:
                 col_cfg["checks"].append({"allowed_values": {"values": allowed}})
 
@@ -704,6 +775,16 @@ def main() -> int:
                 "profile_null_rate": prof_null_rate,
                 "max_null_rate": max_null_rate,
                 "allowed_values": decision.__dict__,
+                "string_noise": {
+                    "enabled": bool(args.string_noise)
+                    and (string_noise_contains or string_noise_regex)
+                    and (
+                        str(args.string_noise_scope) == "all"
+                        or (not decision.emitted and decision.mode == "skip")
+                    ),
+                    "scope": str(args.string_noise_scope),
+                    "params": dict(string_noise_params),
+                },
             }
 
         columns_cfg[c] = col_cfg

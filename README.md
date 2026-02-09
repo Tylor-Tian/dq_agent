@@ -247,8 +247,9 @@ columns:
     required: true
     checks:
       - not_null: { max_null_rate: 0.01 }
+      - string_noise: { contains: ["*", "''"], max_rate: 0.0 }
     anomalies:
-      - missing_rate: { max_null_rate: 0.02 }
+      - missing_rate: { max_rate: 0.02 }
 
   amount:
     type: float
@@ -274,10 +275,79 @@ Deterministic rules:
 - `unique`
 - `range`
 - `allowed_values`
+- `string_noise` (substring / regex pattern based)
 
 Statistical anomalies:
 - `outlier_mad` (robust outliers via MAD z-score)
 - `missing_rate` (null-rate anomaly)
+
+## Benchmarks (real labeled datasets)
+
+We evaluate dq_agent as an **error detector** on datasets that have real labels
+via paired `dirty.csv` / `clean.csv`.
+
+Metrics:
+- **cell-level** precision / recall / F1 (detect wrong cells)
+- **row-level** precision / recall / F1 (detect rows containing any wrong cell)
+
+Reproduce (Raha):
+
+```bash
+bash scripts/run_raha_and_save.sh
+```
+
+Notes:
+- Benchmark harness: `scripts/eval_dirty_clean.py` (auto-generates a config from profile data).
+- The `string_noise` check is **enabled by default** for open-domain string columns in the harness
+  (use `--no-string-noise` to ablate).
+
+Reproduce (PED):
+
+```bash
+bash scripts/run_ped_and_save.sh
+```
+
+To refresh the README benchmark block from `benchmarks/` artifacts:
+
+```bash
+python scripts/update_readme_benchmarks.py
+```
+
+<!-- BENCHMARKS:START -->
+### Raha (7 datasets; dirty vs clean profiles)
+
+| profile | datasets | macro_cell_f1 | micro_cell_f1 | macro_row_f1 | micro_row_f1 | cell_tp/fp/fn | row_tp/fp/fn |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| clean | 7 | 0.684955 | 0.227177 | 0.824243 | 0.209508 | (15957, 105323, 3244) | (12296, 91535, 1253) |
+| dirty | 7 | 0.358737 | 0.058786 | 0.588284 | 0.142788 | (3784, 104080, 17091) | (8081, 91389, 5638) |
+
+Full breakdown: `benchmarks/raha_compare.md`.
+
+### Raha string-noise ablation (patterns: `*`, `''`)
+
+| metric | base | union | Δ |
+|---|---:|---:|---:|
+| macro_cell_f1 | 0.760961 | 0.817760 | 0.056798 |
+| micro_cell_f1 | 0.806936 | 0.841877 | 0.034940 |
+| macro_row_f1  | 0.859008 | 0.915870 | 0.056862 |
+| micro_row_f1  | 0.876437 | 0.925301 | 0.048864 |
+
+Largest per-dataset gain (from the committed compare file):
+
+| dataset | base cell_f1 | union cell_f1 | Δ | base row_f1 | union row_f1 | Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| raha/tax | 0.319744 | 0.718032 | 0.398288 | 0.324004 | 0.722462 | 0.398457 |
+
+Full breakdown: `benchmarks/raha_noise_union/compare.md`.
+
+### PED (additional dirty/clean datasets)
+
+Not generated yet. Run:
+
+```bash
+bash scripts/run_ped_and_save.sh
+```
+<!-- BENCHMARKS:END -->
 
 ## Dev / Tests
 

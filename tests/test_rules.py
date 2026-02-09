@@ -45,3 +45,17 @@ def test_allowed_values_rule_pass_and_fail():
     assert passing["status"] == "PASS"
     assert failing["status"] == "FAIL"
     assert failing["failed_count"] == 1
+
+
+def test_string_noise_rule_detects_literal_patterns():
+    df = pd.DataFrame({"txt": ["ok", "bad*", "also '' bad", None]})
+    result = _run_single_rule(
+        df,
+        "txt",
+        {"string_noise": {"contains": ["*", "''"], "max_rate": 0.0}},
+    )
+
+    assert result["status"] == "FAIL"
+    # only 2 non-null values match the patterns
+    assert result["failed_count"] == 2
+    assert any(s["value"] == "bad*" for s in result["samples"])
