@@ -60,6 +60,7 @@ for ds in "${DATASETS[@]}"; do
     --out  "$DS_BASE" \
     --dataset-name "raha/$ds" \
     --profile-source "$PROFILE_SOURCE" \
+    --no-string-noise \
     --fail-on "$FAIL_ON" \
     --max-domain 2000 \
     --min-domain-coverage 0.98 \

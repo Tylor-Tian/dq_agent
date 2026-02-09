@@ -32,6 +32,13 @@ def generate_demo_data(output_dir: Path, seed: Optional[int] = 42) -> Path:
     df.loc[6, "order_id"] = df.loc[7, "order_id"]
     df.loc[8, "status"] = "UNKNOWN"
 
-    output_path = output_dir / "orders.parquet"
-    df.to_parquet(output_path, index=False)
-    return output_path
+    # Prefer Parquet (faster) but gracefully fall back to CSV if parquet
+    # engines (pyarrow/fastparquet) aren't installed.
+    parquet_path = output_dir / "orders.parquet"
+    try:
+        df.to_parquet(parquet_path, index=False)
+        return parquet_path
+    except Exception:
+        csv_path = output_dir / "orders.csv"
+        df.to_csv(csv_path, index=False)
+        return csv_path

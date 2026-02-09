@@ -72,7 +72,14 @@ def load_profile(root: Path, empty_policy: str) -> Dict:
     return out
 
 
-def render_md(clean: Dict, dirty: Dict, out_md: Path, topn: int = 10) -> None:
+def render_md(
+    clean: Dict,
+    dirty: Dict,
+    out_md: Path,
+    *,
+    title: str = "Raha benchmark summary (dirty vs clean profiles)",
+    topn: int = 10,
+) -> None:
     def fmt(x):
         return "" if x is None else f"{x:.6f}"
 
@@ -83,7 +90,7 @@ def render_md(clean: Dict, dirty: Dict, out_md: Path, topn: int = 10) -> None:
         return xs2[:topn]
 
     md = []
-    md.append("# Raha benchmark summary (dirty vs clean profiles)\n")
+    md.append(f"# {title}\n")
     md.append("| profile | datasets | macro_cell_f1 | micro_cell_f1 | macro_row_f1 | micro_row_f1 | cell_tp/fp/fn | row_tp/fp/fn |")
     md.append("|---|---:|---:|---:|---:|---:|---:|---:|")
     md.append(f"| clean | {clean['datasets']} | {fmt(clean['macro_cell_f1'])} | {fmt(clean['micro_cell_f1'])} | {fmt(clean['macro_row_f1'])} | {fmt(clean['micro_row_f1'])} | {clean['cell_tp_fp_fn']} | {clean['row_tp_fp_fn']} |")
@@ -111,6 +118,11 @@ def main() -> int:
     ap.add_argument("--dirty", required=True, help="bench out root for dirty profile")
     ap.add_argument("--out-md", required=True, help="output markdown file")
     ap.add_argument("--out-json", default=None, help="optional output json file")
+    ap.add_argument(
+        "--title",
+        default="Raha benchmark summary (dirty vs clean profiles)",
+        help="Markdown title (H1) for the rendered compare file.",
+    )
     ap.add_argument("--empty-policy", choices=["perfect","skip","zero"], default="perfect")
     args = ap.parse_args()
 
@@ -119,7 +131,7 @@ def main() -> int:
 
     out_md = Path(args.out_md)
     out_md.parent.mkdir(parents=True, exist_ok=True)
-    render_md(clean, dirty, out_md)
+    render_md(clean, dirty, out_md, title=str(args.title))
 
     if args.out_json:
         out_json = Path(args.out_json)
