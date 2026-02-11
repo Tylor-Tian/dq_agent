@@ -318,8 +318,8 @@ python scripts/update_readme_benchmarks.py
 
 | profile | datasets | macro_cell_f1 | micro_cell_f1 | macro_row_f1 | micro_row_f1 | cell_tp/fp/fn | row_tp/fp/fn |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| clean | 7 | 0.684955 | 0.227177 | 0.824243 | 0.209508 | (15957, 105323, 3244) | (12296, 91535, 1253) |
-| dirty | 7 | 0.358737 | 0.058786 | 0.588284 | 0.142788 | (3784, 104080, 17091) | (8081, 91389, 5638) |
+| clean | 7 | 0.817778 | 0.841898 | 0.915870 | 0.925301 | (16662, 3720, 2538) | (12288, 724, 1260) |
+| dirty | 7 | 0.405580 | 0.303776 | 0.593699 | 0.466883 | (4183, 3488, 15686) | (4395, 714, 9323) |
 
 Full breakdown: `benchmarks/raha_compare.md`.
 
@@ -342,11 +342,12 @@ Full breakdown: `benchmarks/raha_noise_union/compare.md`.
 
 ### PED (additional dirty/clean datasets)
 
-Not generated yet. Run:
+| profile | datasets | macro_cell_f1 | micro_cell_f1 | macro_row_f1 | micro_row_f1 | cell_tp/fp/fn | row_tp/fp/fn |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| clean | 14 | 0.846318 | 0.056526 | 0.857537 | 0.104772 | (40776, 917613, 443580) | (45356, 455137, 319955) |
+| dirty | 14 | 0.200416 | 0.010962 | 0.212178 | 0.035870 | (7726, 917533, 476630) | (14983, 455111, 350328) |
 
-```bash
-bash scripts/run_ped_and_save.sh
-```
+Full breakdown: `benchmarks/ped_compare.md`.
 <!-- BENCHMARKS:END -->
 
 ## Dev / Tests

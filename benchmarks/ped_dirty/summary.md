@@ -1,0 +1,18 @@
+# dq_agent benchmark (PED dirty/clean)
+
+| dataset | rows | cols | profile | truth_err_cells | predicted | cell_f1 | row_f1 | truncated |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| ped/Flight | 2376 | 6 | dirty | 2608 | 0 | 0 | 0 | False |
+| ped/Hospital | 1000 | 19 | dirty | 509 | 0 | 0 | 0 | False |
+| ped/MIMIC | 800000 | 9 | dirty | 155249 | 23751 | 0.00836872 | 0.0896212 | False |
+| ped/Plane | 776067 | 5 | dirty | 288990 | 894531 | 0 | 0 | False |
+| ped/Soccer/Soccer_100k_5% | 100000 | 10 | dirty | 5000 | 1241 | 0.397693 | 0.410587 | False |
+| ped/Soccer/Soccer_10k_10% | 10000 | 10 | dirty | 1000 | 263 | 0.416469 | 0.424879 | False |
+| ped/Soccer/Soccer_10k_20% | 10000 | 10 | dirty | 2000 | 0 | 0 | 0 | False |
+| ped/Soccer/Soccer_10k_30% | 10000 | 10 | dirty | 3000 | 0 | 0 | 0 | False |
+| ped/Soccer/Soccer_10k_40% | 10000 | 10 | dirty | 4000 | 0 | 0 | 0 | False |
+| ped/Soccer/Soccer_10k_5% | 10000 | 10 | dirty | 500 | 120 | 0.387097 | 0.39604 | False |
+| ped/Soccer/Soccer_150k_5% | 150000 | 10 | dirty | 7500 | 1851 | 0.395893 | 0.40888 | False |
+| ped/Soccer/Soccer_200k_5% | 200000 | 10 | dirty | 10000 | 2501 | 0.400128 | 0.413047 | False |
+| ped/Soccer/Soccer_30k_5% | 30000 | 10 | dirty | 1500 | 374 | 0.399146 | 0.413031 | False |
+| ped/Soccer/Soccer_50k_5% | 50000 | 10 | dirty | 2500 | 627 | 0.401023 | 0.414408 | False |
