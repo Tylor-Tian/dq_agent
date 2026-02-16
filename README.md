@@ -4,6 +4,8 @@
 
 A minimal, reproducible **Data Quality + Anomaly Detection CLI** (offline demo with synthetic data).
 
+中文文档请见：[`README.zh-CN.md`](README.zh-CN.md)
+
 - **Input**: a table (CSV / Parquet) + rules config (YAML / JSON)
 - **Output**: a machine-readable `report.json` + a human-readable `report.md`
 - **Demo**: `python -m dq_agent demo`
