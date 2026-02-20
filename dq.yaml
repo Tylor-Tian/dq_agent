@@ -1,0 +1,23 @@
+checks:
+  - id: primary_key_unique
+    type: unique
+    column: order_id
+  - id: amount_non_negative
+    type: min_value
+    column: amount
+    gte: 0
+  - id: email_format
+    type: regex
+    column: email
+    pattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+  - id: null_rate
+    type: null_ratio
+    column: "*"
+    lte: 0.05
+scoring:
+  base: 100
+  penalties:
+    amount_non_negative: 10
+    email_format: 10
+    primary_key_unique: 20
+    null_rate: 5
