@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import json
 import sys
@@ -37,6 +38,7 @@ from dq_agent.run_record import compare_reports, load_run_record, sha256_path, w
 from dq_agent.run_record_schema import RunRecordModel
 from dq_agent.shadow import build_shadow_diff, load_report, write_shadow_diff
 from dq_agent.trace import Tracer
+from dq_agent.runner import run_job as run_demo_job
 
 
 class FailOn(str, Enum):
@@ -1702,3 +1704,51 @@ def validate(
         typer.echo(f"Unexpected error: {exc}", err=True)
         raise typer.Exit(code=1)
     typer.echo("ok")
+
+
+def _resolve_demo_input(inp: str | None, out: str) -> str:
+    if inp:
+        return inp
+    example = Path("examples/orders.csv")
+    if example.exists():
+        return str(example)
+    fallback = Path(out).parent / "orders.csv"
+    fallback.parent.mkdir(parents=True, exist_ok=True)
+    fallback.write_text(
+        "order_id,amount,email\n1,10,a@example.com\n1,-2,bad\n2,,x@example.com\n",
+        encoding="utf-8",
+    )
+    return str(fallback)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="dq")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    demo_parser = subparsers.add_parser("demo")
+    demo_parser.add_argument("--in", dest="inp", default=None)
+    demo_parser.add_argument("--out", dest="out", default="artifacts/demo/report.md")
+    demo_parser.add_argument("--config", dest="config", default=None)
+    demo_parser.add_argument("--limit", dest="limit", type=int, default=0)
+
+    run_parser = subparsers.add_parser("run")
+    run_parser.add_argument("--in", dest="inp", required=True)
+    run_parser.add_argument("--out", dest="out", required=True)
+    run_parser.add_argument("--config", dest="config", default="dq.yaml")
+    run_parser.add_argument("--limit", dest="limit", type=int, default=0)
+
+    args = parser.parse_args(argv)
+    if args.command == "demo":
+        inp = _resolve_demo_input(args.inp, args.out)
+        config = args.config or "dq.yaml"
+        run_demo_job(inp=inp, out=args.out, limit=args.limit, config=config)
+        print(args.out)
+        return 0
+
+    run_demo_job(inp=args.inp, out=args.out, limit=args.limit, config=args.config)
+    print(args.out)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

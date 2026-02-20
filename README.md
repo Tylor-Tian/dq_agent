@@ -2,7 +2,24 @@
 
 [![CI](https://github.com/Tylor-Tian/dq_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Tylor-Tian/dq_agent/actions/workflows/ci.yml)
 
-A minimal, reproducible **Data Quality + Anomaly Detection CLI** (offline demo with synthetic data).
+## Demo in one command
+
+```bash
+dq demo --in examples/orders.csv --out artifacts/demo/report.md
+```
+
+Or use built-in defaults:
+
+```bash
+dq demo --out artifacts/demo/report.md
+```
+
+Use Make targets for setup and demo:
+
+```bash
+make bootstrap
+make demo
+```
 
 中文文档请见：[`README.zh-CN.md`](README.zh-CN.md)
 
