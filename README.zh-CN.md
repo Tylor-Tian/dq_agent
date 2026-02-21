@@ -1,12 +1,41 @@
 # dq_agent（中文说明）
 
 [![CI](https://github.com/Tylor-Tian/dq_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Tylor-Tian/dq_agent/actions/workflows/ci.yml)
+![dq_agent demo](docs/assets/demo.svg)
 
 一个最小可复现的 **数据质量（Data Quality）+ 异常检测 CLI**，内置离线可运行的合成数据 Demo。
 
-- **输入**：数据表（CSV / Parquet）+ 规则配置（YAML / JSON）
-- **输出**：机器可读的 `report.json` + 人可读的 `report.md`
-- **Demo 命令**：`python -m dq_agent demo`
+## 它是什么（What it is）
+
+- 本地/离线可运行的数据质量 CLI，输入支持 CSV/Parquet，规则支持 YAML/JSON。
+- 产出稳定的机器可读 `report.json` 与人可读 `report.md`。
+- 适合作为 CI 中的数据质量 gate（可用退出码做阻断）。
+
+## 它不是什么（What it isn't）
+
+- 不是分布式计算引擎。
+- 不是自动修复系统。
+- 不是 LLM agent。
+
+## 安装（Installation）
+
+从 PyPI 安装：
+
+```bash
+pip install dq-agent
+```
+
+使用 `pipx` 安装（需要先发布到 PyPI）：
+
+```bash
+pipx install dq-agent
+```
+
+仓库开发模式安装：
+
+```bash
+pip install -e ".[test]"
+```
 
 ## 快速开始（Demo）
 
@@ -34,8 +63,40 @@ python -m dq_agent demo --idempotency-key demo-001 --idempotency-mode reuse
 CLI 会输出类似如下 JSON：
 
 ```json
-{"report_json_path": "artifacts/<run_id>/report.json", "report_md_path": "artifacts/<run_id>/report.md", "run_record_path": "artifacts/<run_id>/run_record.json", "trace_path": "artifacts/<run_id>/trace.jsonl"}
+{"report_json_path": "artifacts/<run_id>/report.json", "report_md_path": "artifacts/<run_id>/report.md", "run_record_path": "artifacts/<run_id>/run_record.json", "trace_path": "artifacts/<run_id>/trace.jsonl", "checkpoint_path": "artifacts/<run_id>/checkpoint.json"}
 ```
+
+## CI 集成（GitHub Actions）
+
+你可以把 `dq run` 作为 CI 质量门禁：
+
+```yaml
+name: dq-gate
+on: [push, pull_request]
+jobs:
+  dq:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install -U pip
+          pip install dq-agent
+          # 仓库内使用时可改为:
+          # pip install -e ".[test]"
+      - name: Run data quality gate
+        run: |
+          dq run --data path/to/data.parquet --config path/to/rules.yml --fail-on ERROR
+```
+
+退出码语义：
+
+- `0`：运行成功且未触发 `--fail-on`
+- `1`：I/O 或配置错误
+- `2`：Guardrail/Schema/幂等冲突/回归失败，或触发 `--fail-on`
 
 ## 运行产物
 
@@ -285,5 +346,7 @@ python scripts/update_readme_benchmarks.py
 
 ## 设计文档与许可证
 
+- 发布与协作文档：`CHANGELOG.md`、`CONTRIBUTING.md`、`CODE_OF_CONDUCT.md`、`SECURITY.md`
+- 发布流程说明：`docs/publishing.md`
 - 设计文档：`A0_SPEC.md`
 - License：Apache-2.0
