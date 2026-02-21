@@ -5,13 +5,13 @@
 ## Demo in one command
 
 ```bash
-dq demo --in examples/orders.csv --out artifacts/demo/report.md
+dq demo
 ```
 
-Or use built-in defaults:
+Use a custom output root:
 
 ```bash
-dq demo --out artifacts/demo/report.md
+dq demo --output-dir artifacts/demo_runs
 ```
 
 Use Make targets for setup and demo:
