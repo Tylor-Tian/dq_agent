@@ -201,6 +201,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Codex local workspace metadata
+.codex/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
