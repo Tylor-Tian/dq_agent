@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
+  <title id="title">dq_agent CLI demo output</title>
+  <desc id="desc">Terminal-style demo showing dq demo command, JSON output paths, and report markdown sections.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0f1116"/>
+      <stop offset="100%" stop-color="#090b10"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="760" fill="url(#bg)"/>
+  <rect x="24" y="20" width="1152" height="720" rx="14" fill="#11151d" stroke="#2a3140"/>
+  <circle cx="52" cy="44" r="7" fill="#ff5f56"/>
+  <circle cx="74" cy="44" r="7" fill="#ffbd2e"/>
+  <circle cx="96" cy="44" r="7" fill="#27c93f"/>
+  <text x="120" y="49" fill="#9fb0d1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">dq_agent demo</text>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" fill="#d9e1f2">
+    <text x="48" y="90" fill="#77dd77">$ dq demo</text>
+    <text x="48" y="124" fill="#8bc4ff">{</text>
+    <text x="70" y="154">"report_json_path": "artifacts/&lt;run_id&gt;/report.json",</text>
+    <text x="70" y="184">"report_md_path": "artifacts/&lt;run_id&gt;/report.md",</text>
+    <text x="70" y="214">"run_record_path": "artifacts/&lt;run_id&gt;/run_record.json",</text>
+    <text x="70" y="244">"trace_path": "artifacts/&lt;run_id&gt;/trace.jsonl",</text>
+    <text x="70" y="274">"checkpoint_path": "artifacts/&lt;run_id&gt;/checkpoint.json"</text>
+    <text x="48" y="304" fill="#8bc4ff">}</text>
+
+    <text x="48" y="352" fill="#ffd479"># report.md</text>
+    <text x="48" y="386" fill="#8bc4ff">## Summary</text>
+    <text x="70" y="416">- Run ID: demo-0a1b2c</text>
+    <text x="70" y="446">- Rows: 500, Cols: 5</text>
+
+    <text x="48" y="490" fill="#8bc4ff">## Rule Results</text>
+    <text x="70" y="520">- unique:order_id: FAIL</text>
+    <text x="70" y="550">- range:amount: FAIL</text>
+
+    <text x="48" y="594" fill="#8bc4ff">## Anomalies</text>
+    <text x="70" y="624">- missing_rate:user_id: FAIL</text>
+    <text x="70" y="654">- outlier_mad:amount: FAIL</text>
+  </g>
+</svg>

@@ -1,6 +1,41 @@
 # dq_agent
 
 [![CI](https://github.com/Tylor-Tian/dq_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Tylor-Tian/dq_agent/actions/workflows/ci.yml)
+![dq_agent demo](docs/assets/demo.svg)
+
+中文文档请见：[`README.zh-CN.md`](README.zh-CN.md)
+
+## What it is
+
+- A local/offline data quality CLI for CSV/Parquet inputs with YAML/JSON rules.
+- A deterministic runner that emits `report.json` (machine) and `report.md` (human).
+- A practical gate for CI quality checks using typed exit codes and artifacts.
+
+## What it isn't
+
+- Not a distributed compute engine.
+- Not an automatic data repair/correction system.
+- Not an LLM agent.
+
+## Installation
+
+Install from PyPI:
+
+```bash
+pip install dq-agent
+```
+
+Install with `pipx` (requires package to be published to PyPI first):
+
+```bash
+pipx install dq-agent
+```
+
+Install from source (repo usage):
+
+```bash
+pip install -e ".[test]"
+```
 
 ## Demo in one command
 
@@ -20,12 +55,6 @@ Use Make targets for setup and demo:
 make bootstrap
 make demo
 ```
-
-中文文档请见：[`README.zh-CN.md`](README.zh-CN.md)
-
-- **Input**: a table (CSV / Parquet) + rules config (YAML / JSON)
-- **Output**: a machine-readable `report.json` + a human-readable `report.md`
-- **Demo**: `python -m dq_agent demo`
 
 ## Quickstart (Demo)
 
@@ -53,8 +82,39 @@ python -m dq_agent demo --idempotency-key demo-001 --idempotency-mode reuse
 It prints something like:
 
 ```json
-{"report_json_path": "artifacts/<run_id>/report.json", "report_md_path": "artifacts/<run_id>/report.md", "run_record_path": "artifacts/<run_id>/run_record.json", "trace_path": "artifacts/<run_id>/trace.jsonl"}
+{"report_json_path": "artifacts/<run_id>/report.json", "report_md_path": "artifacts/<run_id>/report.md", "run_record_path": "artifacts/<run_id>/run_record.json", "trace_path": "artifacts/<run_id>/trace.jsonl", "checkpoint_path": "artifacts/<run_id>/checkpoint.json"}
 ```
+
+## CI Integration (GitHub Actions)
+
+Use `dq run` as a quality gate in CI:
+
+```yaml
+name: dq-gate
+on: [push, pull_request]
+jobs:
+  dq:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install -U pip
+          pip install dq-agent
+          # For repository usage instead:
+          # pip install -e ".[test]"
+      - name: Run data quality gate
+        run: |
+          dq run --data path/to/data.parquet --config path/to/rules.yml --fail-on ERROR
+```
+
+Exit code semantics:
+- `0`: run completed and `--fail-on` was not triggered.
+- `1`: I/O/config errors.
+- `2`: guardrail/schema failures, idempotency conflict/regression, or `--fail-on` triggered.
 
 ## Outputs
 
@@ -64,6 +124,7 @@ A demo/run creates a new run directory:
 - `artifacts/<run_id>/report.md`
 - `artifacts/<run_id>/run_record.json` (replayable run record)
 - `artifacts/<run_id>/trace.jsonl` (run trace events, NDJSON)
+- `artifacts/<run_id>/checkpoint.json` (resume checkpoint)
 
 `report.json` and `run_record.json` include `schema_version: 1` at the top level. `report.json` includes an
 `observability` section with timing and rule/anomaly counts.
@@ -399,6 +460,14 @@ source .venv/bin/activate
 ## Spec / Roadmap
 
 Full design doc: `A0_SPEC.md`
+
+## Project docs
+
+- `CHANGELOG.md`
+- `CONTRIBUTING.md`
+- `CODE_OF_CONDUCT.md`
+- `SECURITY.md`
+- `docs/publishing.md`
 
 ## License
 
