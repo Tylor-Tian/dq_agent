@@ -13,4 +13,4 @@ bootstrap:
 	@test -f examples/orders.csv || echo "missing examples/orders.csv"
 
 demo:
-	$(PY) -m dq_agent.cli demo --out artifacts/demo/report.md
+	$(PY) -m dq_agent demo
