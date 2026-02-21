@@ -1,6 +1,6 @@
 ---
 name: dq-agent-m7-schema-first
-description: Use this skill when implementing M7 in dq_agent: enforce schema-first typed boundaries for report.json and run_record.json, add schema/validate CLI, and tests + README updates.
+description: "Use this skill when implementing M7 in dq_agent: enforce schema-first typed boundaries for report.json and run_record.json, add schema/validate CLI, and tests + README updates."
 metadata:
   short-description: dq_agent M7 schema-first workflow
 ---
@@ -67,4 +67,3 @@ Use this skill for any work that:
 - `python -m dq_agent schema --kind report | python -c "import sys,json; json.load(sys.stdin); print('ok')"`
 - `python -m dq_agent schema --kind run_record | python -c "import sys,json; json.load(sys.stdin); print('ok')"`
 - `python -m pytest -q`
-
